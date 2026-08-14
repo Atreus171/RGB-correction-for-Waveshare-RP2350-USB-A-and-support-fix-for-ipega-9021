@@ -283,6 +283,7 @@ elseif(APP_TYPE STREQUAL "btusb2usb")
         "${SHARED_SRC}/bt/bthid/devices/vendors/microsoft/xbox_ble.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/google/stadia_bt.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/augmental/mouthpad_ble.c"
+        "${SHARED_SRC}/bt/bthid/devices/vendors/ipega/ipega_bt.c"
 
         # --- BTstack host + transport ---
         "${SHARED_SRC}/bt/btstack/btstack_host.c"
@@ -422,6 +423,7 @@ elseif(APP_TYPE STREQUAL "controller_btusb")
         "${SHARED_SRC}/bt/bthid/devices/vendors/microsoft/xbox_ble.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/google/stadia_bt.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/augmental/mouthpad_ble.c"
+        "${SHARED_SRC}/bt/bthid/devices/vendors/ipega/ipega_bt.c"
 
         # --- nRF BTstack TLV ---
         "src/btstack_tlv_nrf.c"
@@ -591,6 +593,7 @@ else()
         "${SHARED_SRC}/bt/bthid/devices/vendors/microsoft/xbox_ble.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/google/stadia_bt.c"
         "${SHARED_SRC}/bt/bthid/devices/vendors/augmental/mouthpad_ble.c"
+        "${SHARED_SRC}/bt/bthid/devices/vendors/ipega/ipega_bt.c"
 
         # --- BTstack host + transport ---
         "${SHARED_SRC}/bt/btstack/btstack_host.c"
