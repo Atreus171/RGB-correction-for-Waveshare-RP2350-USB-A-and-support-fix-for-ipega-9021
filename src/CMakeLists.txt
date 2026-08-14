@@ -186,6 +186,7 @@ set(BTHID_DEVICE_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/bt/bthid/devices/vendors/microsoft/xbox_ble.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bt/bthid/devices/vendors/google/stadia_bt.c
     ${CMAKE_CURRENT_SOURCE_DIR}/bt/bthid/devices/vendors/augmental/mouthpad_ble.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/bt/bthid/devices/vendors/ipega/ipega_bt.c
     # MouthPad NUS<->CDC relay (ambient: self-attaches to CDC when linked + a
     # MouthPad is connected; inert otherwise). Companion to the mouthpad_ble HID
     # driver so every BLE app gains MouthPad support without a dedicated app.
