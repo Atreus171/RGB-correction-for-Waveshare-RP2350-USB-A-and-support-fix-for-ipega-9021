@@ -16,62 +16,74 @@ jobs:
       fail-fast: false
       matrix:
         app:
-          - usb2pce_kb2040
-          - usb2gc_kb2040
-          - usb2gc_rp2040zero
-          - usb2nuon_kb2040
-          - usb2dc_kb2040
-          - usb2dc_rp2040zero
-          - usb2neogeo_kb2040
-          - usb2neogeo_pico
-          - usb2neogeo_rp2040zero
-          - n642dc_kb2040
-          - usb23do_rp2040zero
-          - usb2uart_kb2040
-          - usb2usb_pico
-          - usb2usb_pico_w
-          - usb2usb_pico2_w
-          - usb2usb_feather_rp2040
-          - usb2usb_feather_rp2040_usb_host
-          - usb2usb_rp2040zero
-          - usb2usb_rp2350usba
+          - bt2gc_pico_w
+          - bt2gc_pico2_w
+          - bt2n64_pico_w
+          - bt2n64_pico2_w
+          - bt2nuon_pico_w
+          - bt2nuon_pico2_w
           - bt2usb_pico_w
           - bt2usb_pico2_w
           - bt2usb_waveshare_rp2350b_plus_w
-          - bt2n64_pico_w
-          - bt2n64_pico2_w
+          - bt2wiiext_pico_w
           - btusb2usb_pico_w
           - btusb2usb_pico2_w
-          - snes2usb_kb2040
-          - n642usb_kb2040
-          - bt2nuon_pico_w
-          - bt2nuon_pico2_w
-          - n642nuon_pico
-          - nes2usb_pico_w
-          - gc2usb_kb2040
-          - gc2usb_rp2040zero
-          - nes2usb_kb2040
-          - pce2usb_kb2040
-          - pce2usb_pico
-          - pce2usb_pico_w
-          - jvs2usb_rp2040zero
-          - neogeo2usb_kb2040
-          - neogeo2usb_rp2040zero
-          - wii2usb_kb2040
-          - wii2gc_kb2040
-          - bt2wiiext_pico_w
-          - bt2gc_pico_w
-          - bt2gc_pico2_w
-          - controller_fisherprice_v1_kb2040
-          - controller_fisherprice_v2_kb2040
           - controller_alpakka_pico
           - controller_btusb_pico_w
           - controller_btusb_pico2_w
           - controller_btusb_rp2040_abb
+          - controller_fisherprice_v1_kb2040
+          - controller_fisherprice_v2_kb2040
+          - gc2eth_feather_usbhost
+          - gc2eth_rp2040_eth
+          - gc2usb_feather_usbhost
+          - gc2usb_kb2040
+          - gc2usb_rp2040zero
+          - jvs2usb_rp2040zero
+          - lodgenet2gc_pico
+          - lodgenet2n64_pico
           - lodgenet2usb_pico
           - lodgenet2usb_pico2
-          - lodgenet2n64_pico
-          - lodgenet2gc_pico
+          - n642dc_kb2040
+          - n642dc_pico2_w
+          - n642nuon_pico
+          - n642usb_kb2040
+          - neogeo2usb_kb2040
+          - neogeo2usb_rp2040zero
+          - nes2usb_kb2040
+          - nes2usb_pico_w
+          - pce2usb_kb2040
+          - pce2usb_pico
+          - pce2usb_pico_w
+          - snes2usb_kb2040
+          - usb23do_rp2040zero
+          - usb2ami_rp2040zero
+          - usb2ami_xiao
+          - usb2ble_pico_w
+          - usb2ble_pico2_w
+          - usb2dc_kb2040
+          - usb2dc_rp2040zero
+          - usb2gc_kb2040
+          - usb2gc_rp2040zero
+          - usb2n64_kb2040
+          - usb2neogeo_kb2040
+          - usb2neogeo_pico
+          - usb2neogeo_retrofrog
+          - usb2neogeo_rp2040zero
+          - usb2nuon_kb2040
+          - usb2pce_kb2040
+          - usb2uart_kb2040
+          - usb2usb_feather_rp2040
+          - usb2usb_feather_rp2040_max3421
+          - usb2usb_feather_rp2040_usb_host
+          - usb2usb_feather_rp2040_usb_host_max3421
+          - usb2usb_pico
+          - usb2usb_pico_w
+          - usb2usb_pico2_w
+          - usb2usb_rp2040zero
+          - usb2usb_rp2350usba
+          - wii2gc_kb2040
+          - wii2usb_kb2040
 
     steps:
       - name: Checkout code with submodules
