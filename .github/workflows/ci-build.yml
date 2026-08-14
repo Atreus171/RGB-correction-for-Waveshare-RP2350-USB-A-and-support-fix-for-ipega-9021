@@ -1,0 +1,56 @@
+name: CI Build Check
+
+on:
+  push:
+    branches: [main, gamesir-g7-support]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Compile-check the BT/USB input stack (including the iPega driver) on the
+  # boards the fork targets, without publishing anything.
+  build-rpi:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+          - usb2usb_rp2350usba
+          - bt2usb_pico_w
+
+    steps:
+      - name: Checkout code with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and cache Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: joypad:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build ${{ matrix.app }}
+        run: |
+          docker run --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            joypad:latest /bin/bash -c "make ${{ matrix.app }}"
+
+          sudo chown -R $(id -u):$(id -g) releases/
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.app }}
+          path: releases/*.uf2
+          if-no-files-found: error
+          retention-days: 1
