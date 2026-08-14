@@ -27,7 +27,6 @@
 #include "devices/vendors/microsoft/ms_sidewinder_commander.h"
 #include "devices/vendors/valve/steam_controller_2.h"
 #include "devices/vendors/elo/elo_vagabond.h"
-#include "devices/vendors/gamesir/gamesir_g7.h"
 #include "devices/generic/sinput_host.h"
 // Include other devices here
 
@@ -55,7 +54,6 @@ void register_devices() {
     device_interfaces[CONTROLLER_SINPUT] = &sinput_host_interface;
     device_interfaces[CONTROLLER_STEAM_2] = &steam_controller_2_interface;
     device_interfaces[CONTROLLER_ELO_VAGABOND] = &elo_vagabond_interface;
-    device_interfaces[CONTROLLER_GAMESIR_G7] = &gamesir_g7_interface;
     device_interfaces[CONTROLLER_DINPUT] = &hid_gamepad_interface;
     device_interfaces[CONTROLLER_KEYBOARD] = &hid_keyboard_interface;
     device_interfaces[CONTROLLER_MOUSE] = &hid_mouse_interface;
