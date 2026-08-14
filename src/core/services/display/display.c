@@ -330,7 +330,7 @@ bool display_is_initialized(void) {
 // DISPLAY CONTROL
 // ============================================================================
 
-void display_clear(void) {
+__attribute__((weak)) void display_clear(void) {
     memset(framebuffer, 0, sizeof(framebuffer));
 }
 
@@ -464,8 +464,15 @@ void display_set_contrast(uint8_t contrast) {
 // DRAWING PRIMITIVES
 // ============================================================================
 
-void display_pixel(uint8_t x, uint8_t y, bool on) {
-    if (x >= DISPLAY_WIDTH || y >= DISPLAY_HEIGHT) return;
+// Weak: boards with a color face backend (AMOLED) provide their own
+// display_clear/display_pixel/display_set_color; this mono OLED backend
+// yields to those strong definitions at link time.
+__attribute__((weak)) void display_set_color(uint8_t color_index) {
+    (void)color_index;   // mono OLED: no color classes
+}
+
+__attribute__((weak)) void display_pixel(int16_t x, int16_t y, bool on) {
+    if (x < 0 || x >= DISPLAY_WIDTH || y < 0 || y >= DISPLAY_HEIGHT) return;
 
     uint8_t page = y / 8;
     uint8_t bit = y % 8;

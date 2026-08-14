@@ -292,7 +292,6 @@ set(USB_DEVICE_SOURCES
     # PS4 auth flash storage — always compiled so PS4AUTH CDC commands are available
     ${CMAKE_CURRENT_SOURCE_DIR}/core/services/storage/ps4_auth_flash.c
     # PS4 event log — flash-persistent debug log for auth troubleshooting
-    ${CMAKE_CURRENT_SOURCE_DIR}/core/services/storage/ps4_event_log.c
 )
 
 # PS4 local auth sources (RSA signing via mbedTLS, optional)
@@ -312,6 +311,11 @@ set(NES_HOST_SOURCES
 # PCEngine host sources
 set(PCE_HOST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/native/host/pcengine/pce_host.c
+)
+
+# Jaguar host sources
+set(JAGUAR_HOST_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/native/host/jaguar/jaguar_host.c
 )
 
 # SNES host sources
@@ -2675,6 +2679,31 @@ endif()
 joypad_target_common(joypad_pce2usb)
 
 
+# --- JAG2USB (Atari Jaguar -> USB HID) ---
+add_executable(joypad_jag2usb)
+target_compile_definitions(joypad_jag2usb PRIVATE CONFIG_JAG2USB=1 CONFIG_USB=1 DISABLE_USB_HOST=1)
+target_sources(joypad_jag2usb PUBLIC ${CORE_SOURCES} ${USB_DEVICE_SOURCES}
+    ${JAGUAR_HOST_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/apps/jag2usb/app.c
+)
+target_include_directories(joypad_jag2usb PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/apps/jag2usb
+    ${CMAKE_CURRENT_SOURCE_DIR}/usb/usbd
+    ${CMAKE_CURRENT_SOURCE_DIR}/native/host/jaguar
+)
+target_link_libraries(joypad_jag2usb PRIVATE pico_stdlib pico_multicore hardware_pio pico_rand tinyusb_device tinyusb_board)
+# Status LED: Pico W / Pico 2 W's onboard LED is behind the CYW43 chip
+# (WL_GPIO0), so bring up cyw43_arch (no wireless) just to drive it. A plain
+# Pico's LED is a normal GPIO (GP25).
+if (PICO_BOARD STREQUAL "pico_w" OR PICO_BOARD STREQUAL "pico2_w")
+    target_compile_definitions(joypad_jag2usb PRIVATE BOARD_LED_CYW43=1)
+    target_link_libraries(joypad_jag2usb PRIVATE pico_cyw43_arch_none)
+elseif (PICO_BOARD STREQUAL "pico")
+    target_compile_definitions(joypad_jag2usb PRIVATE BOARD_LED_PIN=25)
+endif()
+joypad_target_common(joypad_jag2usb)
+
+
 # --- LODGENET2USB (LodgeNet -> USB HID) ---
 add_executable(joypad_lodgenet2usb)
 target_compile_definitions(joypad_lodgenet2usb PRIVATE CONFIG_LODGENET2USB=1 CONFIG_USB=1 DISABLE_USB_HOST=1 BOARD_LED_PIN=25)
@@ -3040,5 +3069,40 @@ foreach(_t IN LISTS _joypad_all_targets)
         if(_t_srcs MATCHES "ps4_mode\\.c")
             joypad_add_ps4_local_auth(${_t})
         endif()
+    endif()
+endforeach()
+
+# ----------------------------------------------------------------------------
+# USB-output fast clock (200 MHz) — GP2040-CE-style board clock policy.
+#
+# PS4 local-auth RSA signing must land inside the console's challenge window;
+# at the stock 125 MHz a sign takes ~3.4 s, risking the timeout. GP2040-CE
+# raises the whole board to the fastest build-supported clock (200 MHz), which
+# brings signing to ~1.7 s. We do the same — but as a build-time / early-boot
+# board policy (set once in usbd_init() before the USB stack starts, NOT a
+# per-driver runtime hack), and only for the wired controller-emulation
+# USB-output apps.
+#
+# Deliberately EXCLUDED (each keeps its own tuned clock):
+#   - native-input apps (snes2usb/n642usb/gc2usb/lodgenet2usb/…): timing-
+#     critical PIO input is tuned around their clock.
+#   - CYW43 wireless variants (usb_pico_w/pico2_w/bt2usb): BT + SPI-PIO timing
+#     needs separate validation before raising the clock.
+#   - ESP32-S3 / nRF52840: different clock domain, handled by their own ports.
+set(_joypad_usb_fast_clock_targets
+    joypad_usb_feather_rp2040
+    joypad_usb_feather_rp2040_max3421
+    joypad_usb_feather_rp2040_usb_host
+    joypad_usb_feather_rp2040_usb_host_max3421
+    joypad_usb_ogxm_pico
+    joypad_usb_pico
+    joypad_usb_rp2040zero
+    joypad_usb_rp2350usba
+    joypad_usb2usb_remapper_v7_a
+    joypad_usb2usb_remapper_v7_b
+)
+foreach(_t IN LISTS _joypad_usb_fast_clock_targets)
+    if(TARGET ${_t})
+        target_compile_definitions(${_t} PRIVATE JOYPAD_USB_FAST_CLOCK=1)
     endif()
 endforeach()

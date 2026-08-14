@@ -42,7 +42,6 @@
 
 // PS4 auth flash storage (always compiled with USB device sources)
 #include "core/services/storage/ps4_auth_flash.h"
-#include "core/services/storage/ps4_event_log.h"
 // PS4 local RSA signing (requires pico_mbedtls — enabled by ENABLE_PS4_LOCAL_AUTH)
 #ifdef ENABLE_PS4_LOCAL_AUTH
 #include "usb/usbd/modes/ps4_local_auth.h"
@@ -79,10 +78,6 @@ static volatile uint16_t log_tail = 0;  // Read position (streaming)
 static volatile uint16_t dump_pos = 0;
 static volatile uint16_t dump_end = 0;
 static volatile bool     dump_active = false;
-
-// PS4LOG.DUMP buffer: holds full flash log text for synchronous sending
-#define PS4LOG_DUMP_BUF_SIZE 4096
-static char ps4log_dump_buf[PS4LOG_DUMP_BUF_SIZE];
 
 static void log_stdio_out_chars(const char *buf, int len)
 {
@@ -351,6 +346,282 @@ static void cmd_reboot(const char* json)
     pending_reboot_time = platform_time_ms();
 }
 
+#ifdef BOARD_LILYGO_TDISPLAY_S3_AMOLED
+// --- FACE.* — remote control of the AMOLED companion face (eyes_esp32.c).
+// FACE.SPEAK {"v":0-100}  speech envelope -> mouth (lip-sync)
+// FACE.STATE {"state":"idle"|"think"|"speak"}
+// FACE.EMO   {"emo":"happy"|...}
+// FACE.LOOK  {"x":-100..100,"y":-100..100}
+extern void face_remote_speak(int level);
+extern void face_remote_state(const char* state);
+extern bool face_remote_emotion(const char* name);
+extern void face_remote_look(int x_pct, int y_pct);
+
+static void cmd_face_speak(const char* json)
+{
+    int v = 0;
+    json_get_int(json, "v", &v);
+    face_remote_speak(v);
+    send_ok();
+}
+
+static void cmd_face_state(const char* json)
+{
+    int len = 0;
+    const char* st = json_get_string(json, "state", &len);
+    char buf[16] = {0};
+    if (st && len > 0 && len < (int)sizeof(buf)) memcpy(buf, st, (size_t)len);
+    face_remote_state(buf);
+    send_ok();
+}
+
+static void cmd_face_emo(const char* json)
+{
+    int len = 0;
+    const char* e = json_get_string(json, "emo", &len);
+    char buf[16] = {0};
+    if (e && len > 0 && len < (int)sizeof(buf)) memcpy(buf, e, (size_t)len);
+    if (face_remote_emotion(buf)) send_ok();
+    else send_error("unknown emotion");
+}
+
+extern bool face_remote_style(const char* name);
+
+static void cmd_face_style(const char* json)
+{
+    int len = 0;
+    const char* st = json_get_string(json, "style", &len);
+    char buf[16] = {0};
+    if (st && len > 0 && len < (int)sizeof(buf)) memcpy(buf, st, (size_t)len);
+    if (face_remote_style(buf)) send_ok();
+    else send_error("unknown style");
+}
+
+static void cmd_face_look(const char* json)
+{
+    int x = 0, y = 0;
+    json_get_int(json, "x", &x);
+    json_get_int(json, "y", &y);
+    face_remote_look(x, y);
+    send_ok();
+}
+extern bool pmu_init(void);
+extern int pmu_batt_mv(void);
+extern int pmu_vbus_mv(void);
+extern int pmu_charge_state(void);
+extern int pmu_charge_ma(void);
+extern void amoled_brightness(uint8_t level);
+
+static void cmd_batt_get(const char* json)
+{
+    (void)json;
+    int mv = pmu_batt_mv();
+    int pct = (mv - 3300) * 100 / (4200 - 3300);
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    static const char* st[] = {"none", "pre", "charging", "done"};
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"mv\":%d,\"pct\":%d,\"vbus_mv\":%d,"
+             "\"charge\":\"%s\",\"charge_ma\":%d}",
+             mv, pct, pmu_vbus_mv(), st[pmu_charge_state() & 3], pmu_charge_ma());
+    cdc_protocol_send_response(active_ctx, response_buf);
+}
+
+extern void amoled_set_shift(int panel_px);
+
+static void cmd_face_offset(const char* json)
+{
+    int x = 0;
+    json_get_int(json, "x", &x);
+    if (x < -100) x = -100;
+    if (x > 100) x = 100;
+    amoled_set_shift(x);
+    send_ok();
+}
+
+static void cmd_face_bright(const char* json)
+{
+    int v = 208;
+    json_get_int(json, "v", &v);
+    if (v < 0) v = 0;
+    if (v > 255) v = 255;
+    amoled_brightness((uint8_t)v);
+    send_ok();
+}
+
+// FACE.TRACK: pre-shipped lip-sync envelope, played on the face's own clock
+// (zero radio traffic during speech). Chunked to fit the NUS relay:
+//   {"cmd":"FACE.TRACK","seq":0,"d":"<b64 bytes>"}   seq 0 resets the buffer
+//   {"cmd":"FACE.TRACK.GO","step":64,"delay":580}    starts playback
+extern void face_track_reset(void);
+extern bool face_track_append(const uint8_t* d, int n);
+extern void face_track_go(int step_ms, int delay_ms);
+
+static int face_b64_val(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static void cmd_face_track(const char* json)
+{
+    int seq = 0;
+    json_get_int(json, "seq", &seq);
+    if (seq == 0) face_track_reset();
+    int dlen = 0;
+    const char* d = json_get_string(json, "d", &dlen);
+    if (!d || dlen <= 0) {
+        send_error("missing d");
+        return;
+    }
+    uint8_t out[144];
+    int o = 0, acc = 0, bits = 0;
+    for (int i = 0; i < dlen && o < (int)sizeof(out); i++) {
+        int v = face_b64_val(d[i]);
+        if (v < 0) continue;                    // skip '=' / whitespace
+        acc = (acc << 6) | v; bits += 6;
+        if (bits >= 8) { bits -= 8; out[o++] = (uint8_t)(acc >> bits); }
+    }
+    if (!face_track_append(out, o)) {
+        send_error("track overflow");
+        return;
+    }
+    send_ok();
+}
+
+static void cmd_face_track_go(const char* json)
+{
+    int step = 64, delay = 0;
+    json_get_int(json, "step", &step);
+    json_get_int(json, "delay", &delay);
+    face_track_go(step, delay);
+    send_ok();
+}
+
+// FACE.COLOR {"r","g","b"} tints the current style's palette (accent derived);
+// {"reset":1} returns to the style's stock colors.
+extern void eyes_set_color(uint8_t r, uint8_t g, uint8_t b);
+extern void eyes_reset_color(void);
+static void cmd_face_color(const char* json)
+{
+    int reset = 0;
+    json_get_int(json, "reset", &reset);
+    if (reset) {
+        eyes_reset_color();
+        send_ok();
+        return;
+    }
+    int r = 0, g = 0, b = 0;
+    bool any = json_get_int(json, "r", &r);
+    any |= json_get_int(json, "g", &g);
+    any |= json_get_int(json, "b", &b);
+    if (!any) {
+        send_error("missing r/g/b");
+        return;
+    }
+    eyes_set_color((uint8_t)(r & 255), (uint8_t)(g & 255), (uint8_t)(b & 255));
+    send_ok();
+}
+#elif defined(ENABLE_BTSTACK)
+// --- FACE.* on a dongle build: relay to an untethered JoypadOS face.
+// No local display here — a paired JoypadOS BLE controller (e.g. the AMOLED
+// eyes board) carries the face, and its NUS RX feeds the same framed CDC
+// parser as USB. So forwarding = re-frame the command JSON verbatim and write
+// it to the peer's NUS. The host (e.g. Dusty's bridge) talks to one CDC port
+// and the face follows, wired or wireless.
+static void cmd_face_forward(const char* json)
+{
+    static uint8_t fwd_seq;
+    uint16_t len = (uint16_t)strlen(json);
+    uint8_t pkt[5 + 200 + 2];
+    if (len > 200) {
+        send_error("face cmd too long");
+        return;
+    }
+    pkt[0] = CDC_SYNC_BYTE;
+    pkt[1] = len & 0xFF;
+    pkt[2] = (len >> 8) & 0xFF;
+    pkt[3] = CDC_MSG_CMD;
+    pkt[4] = fwd_seq;
+    memcpy(&pkt[5], json, len);
+    uint16_t crc = cdc_crc16(&pkt[3], 2 + len);   // type + seq + payload
+    pkt[5 + len] = crc & 0xFF;
+    pkt[6 + len] = (crc >> 8) & 0xFF;
+    fwd_seq++;
+    if (btstack_host_nus_send(pkt, (uint16_t)(5 + len + 2))) send_ok();
+    else send_error("no face connected");
+}
+
+// NUS.* — forward non-FACE commands to the paired face board. The face's NUS
+// feeds the same framed command parser, so the dongle can reboot it, drop it
+// into the ROM bootloader for a reflash, or change its USB mode even when the
+// face has no usable USB of its own (e.g. a broken CDC descriptor — the exact
+// situation these were added to dig out of).
+static void cmd_nus_reboot(const char* json)
+{
+    (void)json;
+    cmd_face_forward("{\"cmd\":\"REBOOT\"}");
+}
+
+static void cmd_nus_bootsel(const char* json)
+{
+    (void)json;
+    cmd_face_forward("{\"cmd\":\"BOOTSEL\"}");
+}
+
+static void cmd_nus_mode(const char* json)
+{
+    int mode;
+    if (!json_get_int(json, "mode", &mode)) {
+        send_error("missing mode");
+        return;
+    }
+    char inner[48];
+    snprintf(inner, sizeof(inner), "{\"cmd\":\"MODE.SET\",\"mode\":%d}", mode);
+    cmd_face_forward(inner);
+}
+#endif // BOARD_LILYGO_TDISPLAY_S3_AMOLED
+
+// COREDUMP.SUM is available only when esp-idf's coredump component is enabled
+// (CONFIG_ESP_COREDUMP_ENABLE) — espcoredump/CMakeLists.txt puts its public header
+// on the include path only then. Boards without coredump (devkit/feather) omit the
+// command; the lilygo face board enables it in its sdkconfig.
+#if defined(PLATFORM_ESP32) && defined(__has_include)
+#  if __has_include("esp_core_dump.h")
+#    define JOYPAD_HAS_ESP_COREDUMP 1
+#  endif
+#endif
+
+#ifdef JOYPAD_HAS_ESP_COREDUMP
+// COREDUMP.SUM — panic PC + backtrace from the flash coredump (esp-idf).
+// addr2line the addresses against the matching .elf on the host.
+#include "esp_core_dump.h"
+static void cmd_coredump_sum(const char* json)
+{
+    (void)json;
+    esp_core_dump_summary_t sum;
+    if (esp_core_dump_get_summary(&sum) != ESP_OK) {
+        send_error("no coredump");
+        return;
+    }
+    int pos = snprintf(response_buf, sizeof(response_buf),
+                       "{\"task\":\"%s\",\"pc\":\"0x%08lx\",\"bt\":[",
+                       sum.exc_task, (unsigned long)sum.exc_pc);
+    for (uint32_t i = 0; i < sum.exc_bt_info.depth && i < 16; i++) {
+        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                        "%s\"0x%08lx\"", i ? "," : "",
+                        (unsigned long)sum.exc_bt_info.bt[i]);
+    }
+    snprintf(response_buf + pos, sizeof(response_buf) - pos,
+             "],\"corrupt\":%s}", sum.exc_bt_info.corrupted ? "true" : "false");
+    send_json(response_buf);
+}
+#endif
+
 static void cmd_bootsel(const char* json)
 {
     (void)json;
@@ -459,7 +730,9 @@ static void cmd_mode_set(const char* json)
     platform_sleep_ms(50);
     tud_task();
 #endif
-    usbd_set_mode((usb_output_mode_t)mode);
+    if (!usbd_set_mode((usb_output_mode_t)mode)) {
+        send_error("mode switch rejected");
+    }
 }
 
 static void cmd_mode_list(const char* json)
@@ -1728,87 +2001,6 @@ static void cmd_log_clear(const char* json)
     send_ok();
 }
 
-// PS4LOG.DUMP — read flash-persistent auth event log and return it inline in
-// the OK response as {"ok":true,"log":"..."}. No events, no streaming — works
-// exactly like PING. Log text is JSON-escaped and capped at ~900 bytes so the
-// whole response fits in the 1024-byte CDC TX FIFO in one shot.
-static void cmd_ps4log_dump(const char *json)
-{
-    (void)json;
-
-    int log_len = ps4_event_log_dump(ps4log_dump_buf, sizeof(ps4log_dump_buf));
-
-    // Build response into ps4log_dump_buf itself (reuse it — it's 4096 bytes,
-    // more than enough).  We build into a local static to avoid aliasing.
-    static char resp[1024];
-    int pos = 0;
-    pos += snprintf(resp + pos, sizeof(resp) - pos, "{\"ok\":true,\"log\":\"");
-
-    // JSON-escape log text; stop when response would get within 4 bytes of limit
-    for (int i = 0; i < log_len && pos < (int)sizeof(resp) - 20; i++) {
-        unsigned char c = (unsigned char)ps4log_dump_buf[i];
-        if      (c == '\\') { resp[pos++] = '\\'; resp[pos++] = '\\'; }
-        else if (c == '"')  { resp[pos++] = '\\'; resp[pos++] = '"';  }
-        else if (c == '\n') { resp[pos++] = '\\'; resp[pos++] = 'n';  }
-        else if (c == '\r') { resp[pos++] = '\\'; resp[pos++] = 'r';  }
-        else if (c >= 0x20) { resp[pos++] = c; }
-    }
-    resp[pos++] = '"';
-    resp[pos++] = '}';
-    resp[pos]   = '\0';
-
-    cdc_protocol_send_response(active_ctx, resp);
-}
-
-// PS4LOG.CLEAR — erase flash-persistent auth event log (preserves auth key data)
-static void cmd_ps4log_clear(const char *json)
-{
-    (void)json;
-    ps4_event_log_clear();
-    send_ok();
-}
-
-// PS4LOG.ENABLE.GET — check if PS4 auth event logging is enabled
-static void cmd_ps4log_enable_get(const char *json)
-{
-    (void)json;
-#ifdef ENABLE_PS4_LOCAL_AUTH
-    bool enabled = ps4_local_auth_get_log_enabled();
-    snprintf(response_buf, sizeof(response_buf),
-             "{\"enabled\":%s}", enabled ? "true" : "false");
-    send_json(response_buf);
-#else
-    send_error("PS4 local auth not available");
-#endif
-}
-
-// PS4LOG.ENABLE.SET — enable or disable PS4 auth event logging
-static void cmd_ps4log_enable_set(const char *json)
-{
-#ifdef ENABLE_PS4_LOCAL_AUTH
-    bool enabled;
-    if (!json_get_bool(json, "enabled", &enabled)) {
-        send_error("missing enabled");
-        return;
-    }
-
-    ps4_local_auth_set_log_enabled(enabled);
-
-    flash_t flash_data;
-    if (flash_load(&flash_data)) {
-        flash_data.ps4_auth_log = enabled ? 1 : 0;
-        flash_save(&flash_data);
-    }
-
-    snprintf(response_buf, sizeof(response_buf),
-             "{\"enabled\":%s}", enabled ? "true" : "false");
-    send_json(response_buf);
-#else
-    (void)json;
-    send_error("PS4 local auth not available");
-#endif
-}
-
 // ============================================================================
 // PS4 LOCAL AUTH COMMANDS
 // ============================================================================
@@ -2288,9 +2480,28 @@ static void cmd_settings_reset(const char* json)
 }
 
 #ifdef ENABLE_BTSTACK
+// BLE.DROP {"ms":60000} — drop all BLE links, hold reconnection off for the
+// window. Bench tool for radio-contention A/B tests (e.g. DS5 audio with and
+// without the face link) without unpairing anything.
+static void cmd_ble_drop(const char* json)
+{
+    int ms = 60000;
+    json_get_int(json, "ms", &ms);
+    if (ms < 1000) ms = 1000;
+    btstack_host_ble_drop_all((uint32_t)ms);
+    send_ok();
+}
+
 static void cmd_bt_status(const char* json)
 {
     (void)json;
+#ifdef ENABLE_BTSTACK
+    extern int btstack_host_nus_debug(int*);
+    int gattfree = -2;
+    int nus_state = btstack_host_nus_debug(&gattfree);
+#else
+    int gattfree = -2, nus_state = -1;
+#endif
     // Determine transport at compile time
 #if defined(BTSTACK_USE_CYW43)
     const char* transport = "Onboard (CYW43, Classic + BLE)";
@@ -2312,12 +2523,12 @@ static void cmd_bt_status(const char* json)
     btstack_host_get_crash_info(&crash_pc, &crash_lr);
 #endif
     int pos = snprintf(response_buf, sizeof(response_buf),
-             "{\"enabled\":%s,\"scanning\":%s,\"connections\":%d,\"transport\":\"%s\","
+             "{\"enabled\":%s,\"scanning\":%s,\"connections\":%d,\"nus\":%d,\"gattfree\":%d,\"transport\":\"%s\","
              "\"up_s\":%lu,\"crash_pc\":\"%08lx\",\"crash_lr\":\"%08lx\",\"devices\":[",
              btstack_host_is_initialized() ? "true" : "false",
              btstack_host_is_scanning() ? "true" : "false",
              btstack_classic_get_connection_count(),
-             transport,
+             nus_state, gattfree, transport,
              (unsigned long)(platform_time_ms() / 1000),
              (unsigned long)crash_pc, (unsigned long)crash_lr);
 
@@ -3451,6 +3662,38 @@ static const cmd_entry_t commands[] = {
     {"PING", cmd_ping},
     {"REBOOT", cmd_reboot},
     {"BOOTSEL", cmd_bootsel},
+#ifdef JOYPAD_HAS_ESP_COREDUMP
+    {"COREDUMP.SUM", cmd_coredump_sum},
+#endif
+#ifdef BOARD_LILYGO_TDISPLAY_S3_AMOLED
+    {"FACE.SPEAK", cmd_face_speak},
+    {"FACE.STATE", cmd_face_state},
+    {"FACE.EMO", cmd_face_emo},
+    {"FACE.LOOK", cmd_face_look},
+    {"FACE.BRIGHT", cmd_face_bright},
+    {"FACE.OFFSET", cmd_face_offset},
+    {"FACE.STYLE", cmd_face_style},
+    {"FACE.COLOR", cmd_face_color},
+    {"FACE.TRACK", cmd_face_track},
+    {"FACE.TRACK.GO", cmd_face_track_go},
+    {"BATT.GET", cmd_batt_get},
+#elif defined(ENABLE_BTSTACK)
+    // Relay every FACE.* command to a paired JoypadOS face over BLE NUS.
+    {"FACE.SPEAK", cmd_face_forward},
+    {"FACE.STATE", cmd_face_forward},
+    {"FACE.EMO", cmd_face_forward},
+    {"FACE.LOOK", cmd_face_forward},
+    {"FACE.BRIGHT", cmd_face_forward},
+    {"FACE.OFFSET", cmd_face_forward},
+    {"FACE.STYLE", cmd_face_forward},
+    {"FACE.COLOR", cmd_face_forward},
+    {"FACE.TRACK", cmd_face_forward},
+    {"FACE.TRACK.GO", cmd_face_forward},
+    // Remote management of the paired face over the same NUS tunnel.
+    {"NUS.REBOOT", cmd_nus_reboot},
+    {"NUS.BOOTSEL", cmd_nus_bootsel},
+    {"NUS.MODE", cmd_nus_mode},
+#endif
     {"OTA", cmd_ota},
     {"MODE.GET", cmd_mode_get},
     {"MODE.SET", cmd_mode_set},
@@ -3512,6 +3755,7 @@ static const cmd_entry_t commands[] = {
     {"VOICE.STATE", cmd_voice_state},
 #endif
     {"BT.STATUS", cmd_bt_status},
+    {"BLE.DROP", cmd_ble_drop},
     {"BT.BONDS.CLEAR", cmd_bt_bonds_clear},
     {"BT.FORGET", cmd_bt_forget},
     {"WIIMOTE.ORIENT.GET", cmd_wiimote_orient_get},
@@ -3534,10 +3778,6 @@ static const cmd_entry_t commands[] = {
 #endif
     {"LOG.DUMP",       cmd_log_dump},
     {"LOG.CLEAR",      cmd_log_clear},
-    {"PS4LOG.DUMP",        cmd_ps4log_dump},
-    {"PS4LOG.CLEAR",       cmd_ps4log_clear},
-    {"PS4LOG.ENABLE.GET",  cmd_ps4log_enable_get},
-    {"PS4LOG.ENABLE.SET",  cmd_ps4log_enable_set},
     {"PS4AUTH.SET",    cmd_ps4auth_set},
     {"PS4AUTH.STATUS", cmd_ps4auth_status},
     {"PS4AUTH.CLEAR",  cmd_ps4auth_clear},
@@ -3805,4 +4045,3 @@ void cdc_commands_send_disconnect_event(uint8_t port)
              "{\"type\":\"disconnect\",\"port\":%d}", port);
     cdc_protocol_send_event(stream_ctx, response_buf);
 }
-

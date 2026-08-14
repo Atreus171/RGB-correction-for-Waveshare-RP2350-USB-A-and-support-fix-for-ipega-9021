@@ -1054,6 +1054,28 @@ void btstack_host_suppress_scan(bool suppress)
     }
 }
 
+// Diagnostic/bench tool: drop every BLE link and hold off all reconnection
+// (rapid retries, idle ticker, scanning) for a window, so radio-contention
+// A/B tests can run against a genuinely BLE-quiet dongle. The periodic task
+// clears the holdoff (and un-suppresses scanning) when it expires.
+static uint32_t ble_drop_holdoff_until;
+
+void btstack_host_ble_drop_all(uint32_t holdoff_ms)
+{
+    ble_drop_holdoff_until = btstack_run_loop_get_time_ms() + holdoff_ms;
+    scan_suppressed = true;
+    if (btstack_host_is_scanning()) {
+        btstack_host_stop_scan();
+    }
+    for (int i = 0; i < MAX_BLE_CONNECTIONS; i++) {
+        if (hid_state.connections[i].handle != HCI_CON_HANDLE_INVALID) {
+            gap_disconnect(hid_state.connections[i].handle);
+        }
+    }
+    printf("[BTSTACK_HOST] BLE drop: all links down, reconnect held %lums\n",
+           (unsigned long)holdoff_ms);
+}
+
 // ============================================================================
 // CONNECTION
 // ============================================================================
@@ -1212,11 +1234,33 @@ void btstack_host_process(void)
     }
 
     // Recovery watchdog: if we cleaned up a stuck connection but BT transport
-    // appears dead (no inquiry events received within 10s), force a reboot.
+    // appears dead, force a reboot. Two guards keep this from nuking live
+    // sessions (it caused mid-session "stealth reboots", crash_pc=0):
+    //   - any active Classic or BLE link proves the transport works — a
+    //     stalled single connection setup is not a dead radio;
+    //   - a GIAC inquiry takes ~10.24s, so a 10.0s deadline rebooted before
+    //     the all-clear (GAP_EVENT_INQUIRY_COMPLETE) could ever land. 20s
+    //     gives the inquiry room to finish.
     if (classic_state.recovery_start_time != 0 &&
-        (btstack_run_loop_get_time_ms() - classic_state.recovery_start_time) >= 10000) {
-        printf("[BTSTACK_HOST] No BT activity after connection timeout recovery, rebooting\n");
-        platform_reboot();
+        (btstack_run_loop_get_time_ms() - classic_state.recovery_start_time) >= 20000) {
+        bool any_link = btstack_classic_get_connection_count() > 0;
+        for (int i = 0; !any_link && i < MAX_BLE_CONNECTIONS; i++) {
+            any_link = hid_state.connections[i].handle != HCI_CON_HANDLE_INVALID;
+        }
+        if (any_link) {
+            classic_state.recovery_start_time = 0;   // transport demonstrably alive
+        } else {
+            printf("[BTSTACK_HOST] No BT activity after connection timeout recovery, rebooting\n");
+            platform_reboot();
+        }
+    }
+
+    // BLE.DROP holdoff expiry: restore normal reconnect/scan behavior.
+    if (ble_drop_holdoff_until != 0 &&
+        (int32_t)(btstack_run_loop_get_time_ms() - ble_drop_holdoff_until) >= 0) {
+        ble_drop_holdoff_until = 0;
+        scan_suppressed = false;
+        printf("[BTSTACK_HOST] BLE drop holdoff expired, reconnect resumed\n");
     }
 
     // Safety net: if idle with no active connections and not scanning, resume scan.
@@ -1261,6 +1305,37 @@ void btstack_host_process(void)
         strncpy(hid_state.pending_name, hid_state.last_connected_name, sizeof(hid_state.pending_name) - 1);
         hid_state.pending_name[sizeof(hid_state.pending_name) - 1] = '\0';
         btstack_host_connect_ble(hid_state.last_connected_addr, hid_state.last_connected_addr_type);
+    }
+
+    // Bonded-device reconnect while IDLE. The scan-gated path above never runs
+    // once scanning stops, and every scan-resume path is gated on zero Classic
+    // connections — so with a DualSense up, a dropped bonded BLE device could
+    // never re-pair. A direct gap_connect needs no scan (and is kinder to
+    // Classic coexistence than scanning), so keep dialing the bonded device
+    // whenever its link is down.
+    static uint32_t idle_reconnect_ms;
+    if (hid_state.state == BLE_STATE_IDLE &&
+        hid_state.powered_on &&
+        !scan_suppressed &&
+        hid_state.has_last_connected &&
+        hid_state.reconnect_attempt_time == 0) {
+        bool bonded_up = false;
+        for (int i = 0; i < MAX_BLE_CONNECTIONS; i++) {
+            if (hid_state.connections[i].handle != HCI_CON_HANDLE_INVALID &&
+                memcmp(hid_state.connections[i].addr, hid_state.last_connected_addr, 6) == 0) {
+                bonded_up = true;
+                break;
+            }
+        }
+        uint32_t now = btstack_run_loop_get_time_ms();
+        if (!bonded_up && (now - idle_reconnect_ms) >= BLE_RECONNECT_INTERVAL_MS) {
+            idle_reconnect_ms = now;
+            printf("[BTSTACK_HOST] Idle reconnection to bonded device '%s'\n",
+                   hid_state.last_connected_name);
+            strncpy(hid_state.pending_name, hid_state.last_connected_name, sizeof(hid_state.pending_name) - 1);
+            hid_state.pending_name[sizeof(hid_state.pending_name) - 1] = '\0';
+            btstack_host_connect_ble(hid_state.last_connected_addr, hid_state.last_connected_addr_type);
+        }
     }
 }
 
@@ -1458,6 +1533,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             break;
 
         case GAP_EVENT_ADVERTISING_REPORT: {
+            classic_state.recovery_start_time = 0;  // radio demonstrably alive
             bd_addr_t addr;
             gap_event_advertising_report_get_address(packet, addr);
             bd_addr_type_t addr_type = gap_event_advertising_report_get_address_type(packet);
@@ -1603,7 +1679,10 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             // BLE HID gadgets — each doomed connect attempt monopolizes the
             // radio ~10s and takes page scan down with it, blocking the DS5's
             // incoming reconnects (controller blinks then gives up).
-            if (is_generic_ble_hid && !is_known_controller) {
+            // Exception: JoypadOS peers (the untethered face) — the companion
+            // relays FACE.* to them over NUS, and they pair fast (no doom).
+            if (is_generic_ble_hid && !is_known_controller &&
+                strstr(name, "JoypadOS") == NULL) {
                 break;
             }
 #endif
@@ -2118,6 +2197,12 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
 
                     printf("[BTSTACK_HOST] Connected! handle=0x%04X\n", handle);
 
+                    // The attempt is over — clear its timestamp. Leaving it
+                    // stale disabled the idle bonded-reconnect ticker (its
+                    // "no attempt in flight" guard) after the first
+                    // successful connect between reboots.
+                    hid_state.reconnect_attempt_time = 0;
+
                     // Find or create connection entry
                     ble_connection_t *conn = find_free_connection();
                     if (conn) {
@@ -2447,11 +2532,16 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             printf("[BTSTACK_HOST] Disconnected: handle=0x%04X reason=0x%02X\n", handle, reason);
 
             ble_connection_t *conn = find_connection_by_handle(handle);
-            if (conn && conn->conn_index > 0) {
-                // Notify bthid layer before clearing connection
-                // conn_index for BLE uses BLE_CONN_INDEX_OFFSET to distinguish from Classic
-                printf("[BTSTACK_HOST] BLE disconnect: notifying bthid (conn_index=%d)\n", conn->conn_index);
-                bt_on_disconnect(conn->conn_index);
+            if (conn) {
+                // Run FULL BLE cleanup whenever the handle matches a BLE
+                // entry — even if setup never finished (conn_index still 0).
+                // A half-open connection that dropped mid-discovery used to
+                // fall into the Classic branch below and leak its entry +
+                // wedged HIDS client, poisoning every reconnect after it.
+                if (conn->conn_index > 0) {
+                    printf("[BTSTACK_HOST] BLE disconnect: notifying bthid (conn_index=%d)\n", conn->conn_index);
+                    bt_on_disconnect(conn->conn_index);
+                }
                 uint16_t dcid = conn->hids_cid;   // capture before the memset clears it
                 memset(conn, 0, sizeof(*conn));
                 conn->handle = HCI_CON_HANDLE_INVALID;
@@ -2488,7 +2578,8 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
                 hid_state.state = BLE_STATE_IDLE;
 
                 // Try to reconnect to last connected device if we have one stored
-                if (hid_state.has_last_connected && hid_state.reconnect_attempts < 5) {
+                if (hid_state.has_last_connected && hid_state.reconnect_attempts < 5 &&
+                    ble_drop_holdoff_until == 0) {
                     hid_state.reconnect_attempts++;
                     printf("[BTSTACK_HOST] Attempting BLE reconnection to stored device (attempt %d)...\n",
                            hid_state.reconnect_attempts);
@@ -2834,12 +2925,14 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
 }
 
 // ============================================================================
-// MOUTHPAD NUS (Nordic UART Service) CLIENT
+// NUS (Nordic UART Service) CLIENT
 // ============================================================================
-// Self-contained GATT client for the Augmental MouthPad's NUS stream. Acts
-// ONLY on MouthPad connections (gated by mp_nus_mark_pending, which the
-// connection-ready path calls only when the device name contains "MouthPad"),
-// so it has no effect on any other controller. Discovery is dynamic by
+// Self-contained GATT client for a peer's NUS stream. Acts ONLY on recognized
+// NUS peers (gated by mp_nus_mark_pending, which the connection-ready path
+// calls for device names containing "MouthPad" or "JoypadOS", and the DIS
+// path for their PnP IDs), so it has no effect on any other controller.
+// Peers: Augmental MouthPad (CDC relay via mp_bridge) and JoypadOS BLE
+// controllers (FACE.* command relay from cdc_commands). Discovery is dynamic by
 // 128-bit UUID (no hardcoded handles) and is deferred ~1.5 s after connect so
 // it runs after the HIDS client has finished its own GATT discovery (the
 // gatt_client allows one query at a time per connection).
@@ -2899,6 +2992,28 @@ void btstack_host_set_mouthpad_nus_rx_cb(void (*cb)(const uint8_t*, uint16_t))
 bool btstack_host_mouthpad_nus_ready(void)
 {
     return mp_nus.state == MP_NUS_READY;
+}
+
+// Diagnostic: NUS client state + whether the GATT client is free (0 = busy).
+int btstack_host_nus_debug(int* gatt_ready)
+{
+    if (gatt_ready) {
+        *gatt_ready = (mp_nus.handle != HCI_CON_HANDLE_INVALID)
+                          ? (int)gatt_client_is_ready(mp_nus.handle) : -1;
+    }
+    return (int)mp_nus.state;
+}
+
+// Generic aliases: the client serves any recognized NUS peer (MouthPad or
+// JoypadOS face controller), so new callers get peer-neutral names.
+bool btstack_host_nus_ready(void)
+{
+    return btstack_host_mouthpad_nus_ready();
+}
+
+bool btstack_host_nus_send(const uint8_t* data, uint16_t len)
+{
+    return btstack_host_mouthpad_nus_send(data, len);
 }
 
 // Fill `out` with the connected MouthPad's device info (for the dongle-level
@@ -3031,12 +3146,63 @@ static void mp_nus_gatt_handler(uint8_t packet_type, uint16_t channel, uint8_t* 
     }
 }
 
+// NOTE: an RSSI-poll "liveness" watchdog was tried here and removed —
+// HCI_Read_RSSI is answered by the LOCAL controller (not the peer), so it
+// can't detect a dead link; under Classic+BLE coexistence load the CYW43
+// delays the command-complete and the watchdog shot healthy links every 8s.
+// Zombie links are covered by the peripheral's 6s supervision timeout plus
+// the NUS re-arm / GATT-wedge watchdogs below.
+
 // Periodic: kick off discovery once the HID side has settled.
 static void mp_nus_periodic(void)
 {
+    if (mp_nus.state == MP_NUS_IDLE) {
+        // Self-heal: a NUS peer is connected but the client is unarmed —
+        // discovery failed once (e.g. raced the HIDS client right after a
+        // reconnect) or the arming event was missed. Without this the FACE
+        // relay stays dead while the BLE link is perfectly healthy. Re-arm
+        // with a gentle backoff.
+        static uint32_t next_rearm_ms = 0;
+        uint32_t now = btstack_run_loop_get_time_ms();
+        if (now < next_rearm_ms) return;
+        next_rearm_ms = now + 3000;
+        for (int i = 0; i < MAX_BLE_CONNECTIONS; i++) {
+            ble_connection_t* bc = &hid_state.connections[i];
+            if (bc->handle == HCI_CON_HANDLE_INVALID) continue;
+            if (hci_connection_for_handle(bc->handle) == NULL)
+                continue;   // stale entry — never operate on a dead handle
+            if (strstr(bc->name, "MouthPad") != NULL ||
+                strstr(bc->name, "JoypadOS") != NULL ||
+                (bc->vid == 0x1915 && bc->pid == 0xEEEE) ||
+                (bc->vid == 0x2E8A && bc->pid == 0x10C6)) {
+                printf("[MP_NUS] Re-arming NUS for connected peer '%s'\n",
+                       bc->name);
+                mp_nus_mark_pending(bc->handle);
+                break;
+            }
+        }
+        return;
+    }
     if (mp_nus.state != MP_NUS_PENDING) return;
     if ((btstack_run_loop_get_time_ms() - mp_nus.pending_since) < 1500) return;
-    if (gatt_client_is_ready(mp_nus.handle) == 0) return;   // another query in flight
+    if (gatt_client_is_ready(mp_nus.handle) == 0) {
+        // Watchdog: if the GATT client stays busy (a wedged HIDS query after
+        // an ungraceful reconnect), NUS can never arm and the relay is dead
+        // despite a live link. Force a clean reconnect.
+        if ((btstack_run_loop_get_time_ms() - mp_nus.pending_since) > 15000) {
+            // only touch the link if the HCI connection actually still
+            // exists — gap_disconnect on a stale handle asserts inside
+            // BTstack (crash-reboots the dongle)
+            if (hci_connection_for_handle(mp_nus.handle) != NULL) {
+                printf("[MP_NUS] GATT client wedged for 15s — forcing reconnect\n");
+                gap_disconnect(mp_nus.handle);
+            } else {
+                printf("[MP_NUS] Wedged on a stale handle — resetting client\n");
+            }
+            mp_nus_reset();
+        }
+        return;   // another query in flight
+    }
     mp_nus.state = MP_NUS_DISC_SERVICE;
     mp_nus.service.start_group_handle = 0;
     printf("[MP_NUS] Starting NUS discovery on 0x%04X\n", mp_nus.handle);
@@ -4116,12 +4282,14 @@ static void dis_client_handler(uint8_t packet_type, uint16_t channel, uint8_t *p
                 printf("[BTSTACK_HOST] DIS: updating device info for conn_index=%d\n", conn->conn_index);
                 bthid_update_device_info(conn->conn_index, conn->name, vid, pid);
             }
-            // Recognize the MouthPad by its Augmental DIS PnP ID (0x1915:0xEEEE)
-            // and arm the NUS relay — names can be reset to dev values that lack
-            // "MouthPad" (the name gate at the 0x1C handler then misses it, leaving
-            // the relay stuck "scanning"). mp_nus_mark_pending is a no-op if already
-            // armed by the name gate.
-            if (vid == 0x1915 && pid == 0xEEEE) {
+            // Recognize NUS peers by DIS PnP ID and arm the NUS client — names
+            // can be reset to dev values that miss the name gate at the 0x1C
+            // handler (which leaves the relay stuck "scanning").
+            // mp_nus_mark_pending is a no-op if already armed by the name gate.
+            //   0x1915:0xEEEE — Augmental MouthPad
+            //   0x2E8A:0x10C6 — JoypadOS BLE controller (face relay)
+            if ((vid == 0x1915 && pid == 0xEEEE) ||
+                (vid == 0x2E8A && pid == 0x10C6)) {
                 mp_nus_mark_pending(handle);
             }
             break;
@@ -4260,7 +4428,9 @@ static void hids_client_handler(uint8_t packet_type, uint16_t channel, uint8_t *
                 // which previously left the NUS relay stuck unarmed -> the app
                 // shows "scanning" despite a paired MouthPad).
                 if (nconn && (strstr(nconn->name, "MouthPad") != NULL ||
-                              strstr(hid_state.last_connected_name, "MouthPad") != NULL)) {
+                              strstr(hid_state.last_connected_name, "MouthPad") != NULL ||
+                              strstr(nconn->name, "JoypadOS") != NULL ||
+                              strstr(hid_state.last_connected_name, "JoypadOS") != NULL)) {
                     mp_nus_mark_pending(nhandle);
                 }
             }

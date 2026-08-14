@@ -27,6 +27,7 @@ set(ESP32_COMMON_SRCS
     "ps4_auth_stubs.c"
     "ws2812_esp32.c"
     "button_esp32.c"
+    "rm67162_amoled.c"
     "${SHARED_SRC}/platform/esp32/platform_esp32.c"
 )
 
@@ -280,6 +281,15 @@ set(SRCS
     "${TINYUSB_PATH}/src/portable/synopsys/dwc2/dwc2_common.c"
 )
 
+# Procedural face on the LilyGo AMOLED (shared engine + ESP backend/task)
+if(CONFIG_BOARD STREQUAL "lilygo_tdisplay_s3_amoled")
+    list(APPEND SRCS
+        "${SHARED_SRC}/core/services/display/face_anim.c"
+        "eyes_esp32.c"
+        "pmu_esp32.c"
+    )
+endif()
+
 # Add BTstack sources when needed
 if(APP_NEEDS_BTSTACK)
     # --- BTstack core (shared by all BTstack modes) ---
@@ -309,7 +319,10 @@ if(APP_NEEDS_BTSTACK)
         "${BTSTACK_PATH}/src/ble/att_db.c"
         "${BTSTACK_PATH}/src/ble/att_db_util.c"
         "${BTSTACK_PATH}/src/ble/att_server.c"
-        "${BTSTACK_PATH}/src/ble/le_device_db_memory.c"
+        # le_device_db_tlv ONLY — compiling le_device_db_memory.c alongside it
+        # silently wins the static-archive link and bonds live in RAM, so the
+        # device forgets every pairing at reboot (macOS keeps its side and the
+        # reconnect fails encryption). NVS-backed TLV persists bonds + SM IR/ER.
         "${BTSTACK_PATH}/src/ble/le_device_db_tlv.c"
 
         # --- BTstack 3rd-party ---
@@ -380,6 +393,9 @@ if(APP_NEEDS_BTSTACK)
             "${BTSTACK_PATH}/src/btstack_hid_parser.c"
             # BTstack Classic link key DB (needed by btstack_port_esp32.c)
             "${BTSTACK_PATH}/src/classic/btstack_link_key_db_tlv.c"
+            # Stub btstack_host_nus_send: cdc_commands.c's FACE.* NUS relay
+            # references it, but the real impl (btstack_host.c) is central-only.
+            "btstack_host_nus_stub.c"
         )
     endif()
 endif()
@@ -388,6 +404,7 @@ set(INCLUDE_DIRS
     "."
     "${SHARED_SRC}"
     "${APP_INCLUDE_DIR}"
+    "${SHARED_SRC}/core/services/display"
     "${SHARED_SRC}/usb/usbd"
     "${SHARED_SRC}/pad"
     "${SHARED_SRC}/lib/libxsm3"
@@ -432,11 +449,13 @@ endif()
 # Component requirements
 set(ESP_REQUIRES
     nvs_flash
+    espcoredump
     esp_driver_gpio
     esp_adc
     esp_driver_i2c
     esp_driver_rmt
     esp_driver_spi
+    esp_lcd
     esp_driver_uart
     esp_timer
     esp_hw_support
@@ -512,6 +531,12 @@ if(NOT DEFINED CONFIG_BOARD)
 endif()
 if(CONFIG_BOARD STREQUAL "feather_esp32s3")
     target_compile_definitions(${COMPONENT_LIB} PUBLIC BOARD_FEATHER_ESP32S3=1)
+endif()
+if(CONFIG_BOARD STREQUAL "lilygo_tdisplay_s3_amoled")
+    target_compile_definitions(${COMPONENT_LIB} PUBLIC
+        BOARD_LILYGO_TDISPLAY_S3_AMOLED=1
+        EYES_SCALE=6
+        CONFIG_BLE_USB_COEXIST=1)
 endif()
 
 # App-specific definitions

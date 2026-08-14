@@ -15,8 +15,8 @@
 
 #include "usbd.h"
 #include "usbd_mode.h"
-#if defined(CONFIG_JOYBUS_BRIDGE)
-#include "hardware/clocks.h"  // set_sys_clock_khz — see joybus clock note in usbd_init
+#if defined(CONFIG_JOYBUS_BRIDGE) || defined(JOYPAD_USB_FAST_CLOCK)
+#include "hardware/clocks.h"  // set_sys_clock_khz — see clock policy in usbd_init
 #endif
 #include "descriptors/hid_descriptors.h"
 #include "descriptors/sinput_descriptors.h"
@@ -51,7 +51,6 @@
 #endif
 #ifdef ENABLE_PS4_LOCAL_AUTH
 #include "usb/usbd/modes/ps4_local_auth.h"
-#include "core/services/storage/ps4_event_log.h"
 #endif
 #include "tusb.h"
 #include "device/usbd_pvt.h"
@@ -555,6 +554,16 @@ void usbd_init(void)
     // and GBA replies never decode (rx=000000 timeouts).
     bool clk_ok = set_sys_clock_khz(130000, true);
     printf("[usbd] sys_clock=130MHz set: %s\n", clk_ok ? "OK" : "FAIL");
+#elif defined(JOYPAD_USB_FAST_CLOCK)
+    // USB-output controller-emulation apps run at 200 MHz — the fastest
+    // build-supported clock, same value GP2040-CE uses — so PS4 local-auth
+    // RSA signing completes inside the console's ~challenge window (~1.7 s vs
+    // ~3.4 s at 125 MHz). Set here, once, before the USB stack starts: this is
+    // a board-level clock policy, not a per-driver runtime hack. Console-output
+    // and native-input apps never call usbd_init(), so they keep their own
+    // tuned clocks. Scoped in CMake (JOYPAD_USB_FAST_CLOCK) to wired RP2 apps.
+    bool clk_ok = set_sys_clock_khz(200000, true);
+    printf("[usbd] sys_clock=200MHz set: %s\n", clk_ok ? "OK" : "FAIL");
 #endif
     printf("[usbd] Initializing USB device output\n");
 
@@ -564,8 +573,6 @@ void usbd_init(void)
     // Initialize and load settings from flash
     flash_init();
 #ifdef ENABLE_PS4_LOCAL_AUTH
-    // Initialize flash event log (scan for next empty slot)
-    ps4_event_log_init();
     // Load PS4 auth key material from flash (requires flash_init to have run first)
     ps4_local_auth_init();
 #endif
@@ -1666,10 +1673,16 @@ static const uint8_t desc_frag_cdc0[] = {
 #endif
 };
 
-// CDC-only fragment (no HID interfaces — CDC starts at interface 0)
-#define EPNUM_CDC_ONLY_NOTIF  0x81
-#define EPNUM_CDC_ONLY_OUT    0x01
-#define EPNUM_CDC_ONLY_IN     0x82
+// CDC-only fragment (no HID interfaces — CDC starts at interface 0).
+// KNOWN BUG (open): on ESP32-S3 this mode enumerates far enough for the host
+// to read strings but never configures (macOS: device stuck !matched, no
+// serial port; invisible to libusb). Not the EP numbers — 0x81/0x01/0x82 and
+// the composite's proven 0x82/0x03/0x83 both fail identically. Works on
+// RP2040 (gc2eth/CONFIG_NGC). Until root-caused, don't ship ESP32 boards
+// defaulted to this mode; NUS.MODE via a paired dongle is the escape hatch.
+#define EPNUM_CDC_ONLY_NOTIF  0x82
+#define EPNUM_CDC_ONLY_OUT    0x03
+#define EPNUM_CDC_ONLY_IN     0x83
 static const uint8_t desc_frag_cdc_only[] = {
     TUD_CDC_DESCRIPTOR(0, 4, EPNUM_CDC_ONLY_NOTIF, 8, EPNUM_CDC_ONLY_OUT, EPNUM_CDC_ONLY_IN, 64),
 };

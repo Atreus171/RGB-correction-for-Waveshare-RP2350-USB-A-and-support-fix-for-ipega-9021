@@ -174,17 +174,36 @@ static void n64_task(void)
 // USBR -> N64 BUTTON MAPPING
 // ============================================================================
 
-// Convert unsigned 8-bit analog (0-255, 128=center) to N64 signed (-128 to +127)
+// Authentic N64 stick cardinal magnitude. A real N64 stick does NOT reach the
+// full signed ±127 — OEM sticks peak around ±80-85 (mid-80s), and games are
+// calibrated for that. Emitting ±127 over-ranges every axis (~1.6x too far),
+// which reads as a maxed-out square on a stick-test ROM and makes movement
+// feel pegged. Tunable: raise/lower to taste (verify with the mimi test ROM).
+#ifndef N64_STICK_RANGE
+#define N64_STICK_RANGE 84
+#endif
+
+// Convert unsigned 8-bit analog (0-255, 128=center) to N64 signed, scaled to
+// the authentic ±N64_STICK_RANGE instead of the full ±127.
 static inline int8_t analog_u8_to_n64(uint8_t val) {
+#ifdef CONFIG_LODGENET2N64
+    // LodgeNet is a NATIVE N64 controller driving an N64 console, so its stick is
+    // already in N64 units — decode it verbatim (no scaling, no range clamp) so the
+    // console sees exactly what the controller reports. All range shaping is done
+    // host-side in lodgenet_host.c, which knows N64 vs GC input (GC is pre-scaled
+    // there); this keeps the N64 path a true 1:1 passthrough with zero clipping.
+    return (int8_t)((int32_t)val - 128);
+#else
     // HID: 0=up/left, 128=center, 255=down/right
-    // N64: -128=left/down, 0=center, +127=right/up
-    int16_t centered = (int16_t)val - 128;
+    // N64: negative=left/down, 0=center, positive=right/up
+    int32_t centered = (int32_t)val - 128;              // -128..+127
+    int32_t scaled   = (centered * N64_STICK_RANGE) / 127;
 
-    // Clamp to N64 range
-    if (centered > 127) centered = 127;
-    if (centered < -128) centered = -128;
+    if (scaled >  N64_STICK_RANGE) scaled =  N64_STICK_RANGE;
+    if (scaled < -N64_STICK_RANGE) scaled = -N64_STICK_RANGE;
 
-    return (int8_t)centered;
+    return (int8_t)scaled;
+#endif
 }
 
 // Map C-buttons from right analog stick position
@@ -235,7 +254,9 @@ static void map_usbr_to_n64_report(const profile_output_t* output, n64_report_t*
     // N64: positive X = right, positive Y = up
     // HID: 0=up/left, 128=center, 255=down/right
     report->stick_x = analog_u8_to_n64(output->left_x);
-    report->stick_y = -analog_u8_to_n64(output->left_y) - 1;  // Invert Y: HID 0=up, N64 +127=up
+    // Invert Y: HID 0=up, N64 positive=up. Range is now symmetric (±N64_STICK_RANGE),
+    // so no -1 fixup is needed and center maps cleanly to 0.
+    report->stick_y = -analog_u8_to_n64(output->left_y);
 }
 
 // ============================================================================
