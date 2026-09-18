@@ -44,8 +44,9 @@ uint8_t byteScaleAnalog(int16_t xbox_val);
 // Custom USB Host Drivers
 //--------------------------------------------------------------------+
 
-#if CFG_TUH_XINPUT || CFG_TUH_BTD
+#if CFG_TUH_XINPUT || CFG_TUH_BTD || CFG_TUH_X360_AUDIO
 #include <string.h>
+#include "usb/usbh/x360audio/x360_audio.h"
 
 // Count how many drivers we have
 enum {
@@ -54,6 +55,9 @@ enum {
     + 1
 #endif
 #if CFG_TUH_BTD
+    + 1
+#endif
+#if CFG_TUH_X360_AUDIO
     + 1
 #endif
 };
@@ -71,6 +75,9 @@ usbh_class_driver_t const* usbh_app_driver_get_cb(uint8_t* driver_count) {
 #endif
 #if CFG_TUH_BTD
         memcpy(&drivers[idx++], &usbh_btstack_driver, sizeof(usbh_class_driver_t));
+#endif
+#if CFG_TUH_X360_AUDIO
+        memcpy(&drivers[idx++], &usbh_x360audio_driver, sizeof(usbh_class_driver_t));
 #endif
         drivers_initialized = true;
     }

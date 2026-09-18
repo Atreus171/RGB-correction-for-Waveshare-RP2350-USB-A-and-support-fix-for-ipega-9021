@@ -129,6 +129,7 @@
 #endif
 #define CFG_TUH_VENDOR              0
 #define CFG_TUH_XINPUT              8   // Max 8 XInput interfaces (5 pads through a hub + Xbox wireless adapter ports)
+#define CFG_TUH_X360_AUDIO          8   // Xbox 360 wired headset/audio host (Interface 1) - diagnostic mode
 
 // Bluetooth dongle support - only enabled when ENABLE_BTSTACK is defined by CMake
 // CYW43 targets use built-in BT via pico_btstack, not USB dongle class

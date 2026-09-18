@@ -26,6 +26,11 @@ extern void hid_task(void);
 // X-input protocol handlers
 extern void xinput_task(void);
 
+// Xbox 360 headset/audio (Interface 1) protocol handlers
+#if CFG_TUH_X360_AUDIO
+extern void x360_audio_task(void);
+#endif
+
 // BTstack (Bluetooth) protocol handlers
 #if CFG_TUH_BTD
 #include "btd/hci_transport_h2_tinyusb.h"
@@ -210,6 +215,10 @@ void usbh_task(void)
 
 #if CFG_TUH_XINPUT
     xinput_task();
+#endif
+
+#if CFG_TUH_X360_AUDIO
+    x360_audio_task();
 #endif
 
 #if CFG_TUH_HID
