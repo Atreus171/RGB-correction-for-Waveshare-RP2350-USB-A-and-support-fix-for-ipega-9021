@@ -35,6 +35,9 @@
 #define X360_AUDIO_STAT_MS     1000
 #define X360_AUDIO_REEARM_MS   100
 
+// Depth of the config-probe queue drained one frame at a time.
+#define X360_AUDIO_CFG_QUEUE   8
+
 typedef struct
 {
     bool    claimed;            // interface claimed (open succeeded)
@@ -56,6 +59,12 @@ typedef struct
     uint8_t status_buf[X360_AUDIO_FRAME_SIZE];
     uint8_t phone_tx[X360_AUDIO_FRAME_SIZE];
     uint8_t cfg_tx[X360_AUDIO_FRAME_SIZE];
+
+    // Config-probe queue (0x03 OUT). Drained by x360_audio_task.
+    uint8_t cfg_queue_len[X360_AUDIO_CFG_QUEUE];
+    uint8_t cfg_queue[X360_AUDIO_CFG_QUEUE][X360_AUDIO_FRAME_SIZE];
+    uint8_t cfg_queue_head;
+    uint8_t cfg_queue_tail;
 
     bool    mic_frame_new;                          // last mic frame changed
     uint8_t last_mic[X360_AUDIO_FRAME_SIZE];        // for change detection
@@ -123,6 +132,30 @@ static void x360_arm_status_read(x360_audio_dev_t* s, uint8_t dev_addr)
         return;
     }
     s->status_xfer_active = true;
+}
+
+// Pop one queued config probe (0x03 OUT) when the endpoint is idle. Runs from
+// x360_audio_task so a multi-frame script (e.g. the headset init sequence)
+// does not collide with the busy guard in x360_audio_send_config.
+static void x360_cfg_pump(x360_audio_dev_t* s, uint8_t dev_addr)
+{
+    if (!s->claimed || !s->ep_cfg_out) return;
+    if (s->cfg_xfer_active) return;
+    if (s->cfg_queue_head == s->cfg_queue_tail) return;
+
+    uint8_t idx = s->cfg_queue_head;
+    uint16_t len = s->cfg_queue_len[idx];
+
+    tu_memclr(s->cfg_tx, sizeof(s->cfg_tx));
+    memcpy(s->cfg_tx, s->cfg_queue[idx], len);
+
+    if (!usbh_edpt_xfer(dev_addr, s->ep_cfg_out, s->cfg_tx, X360_AUDIO_FRAME_SIZE))
+    {
+        return; // retry on the next tick
+    }
+    s->cfg_xfer_active = true;
+    s->cfg_queue_head = (uint8_t)((idx + 1) % X360_AUDIO_CFG_QUEUE);
+    printf("[x360audio] d=%02u cfg out (%u bytes)\n", dev_addr, (unsigned)len);
 }
 
 //--------------------------------------------------------------------+
@@ -425,6 +458,23 @@ bool x360_audio_send_config(uint8_t dev_addr, uint8_t const* cmd, uint16_t len)
     return true;
 }
 
+bool x360_audio_queue_config(uint8_t dev_addr, uint8_t const* cmd, uint16_t len)
+{
+    x360_audio_dev_t* s = slot_get(dev_addr);
+    if (!s || !s->claimed || !s->ep_cfg_out) return false;
+    if (len > X360_AUDIO_FRAME_SIZE) return false;
+
+    uint8_t next = (uint8_t)((s->cfg_queue_tail + 1) % X360_AUDIO_CFG_QUEUE);
+    if (next == s->cfg_queue_head) return false; // queue full
+
+    uint8_t idx = s->cfg_queue_tail;
+    tu_memclr(s->cfg_queue[idx], sizeof(s->cfg_queue[idx]));
+    memcpy(s->cfg_queue[idx], cmd, len);
+    s->cfg_queue_len[idx] = (uint8_t)len;
+    s->cfg_queue_tail = next;
+    return true;
+}
+
 bool x360_audio_send_phone(uint8_t dev_addr, uint8_t const* frame, uint16_t len)
 {
     x360_audio_dev_t* s = slot_get(dev_addr);
@@ -445,6 +495,16 @@ bool x360_audio_send_phone(uint8_t dev_addr, uint8_t const* frame, uint16_t len)
     return true;
 }
 
+uint8_t x360_audio_active_addr(void)
+{
+    for (uint8_t dev_addr = 1; dev_addr <= CFG_TUH_DEVICE_MAX; dev_addr++)
+    {
+        x360_audio_dev_t* s = slot_get(dev_addr);
+        if (s && s->claimed) return dev_addr;
+    }
+    return 0;
+}
+
 void x360_audio_task(void)
 {
     for (uint8_t dev_addr = 1; dev_addr <= CFG_TUH_DEVICE_MAX; dev_addr++)
@@ -463,6 +523,9 @@ void x360_audio_task(void)
         {
             x360_arm_status_read(s, dev_addr);
         }
+
+        // Drain any queued config probes (0x03 OUT).
+        x360_cfg_pump(s, dev_addr);
 
         // Periodic diagnostics summary.
         if (now - s->last_stat_ms >= X360_AUDIO_STAT_MS)

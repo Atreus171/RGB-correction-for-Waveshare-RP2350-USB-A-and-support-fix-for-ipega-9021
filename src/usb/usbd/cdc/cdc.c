@@ -9,6 +9,9 @@
 #include "core/services/storage/flash.h"
 #include "platform/platform.h"
 #include "tusb.h"
+#if CFG_TUH_X360_AUDIO && defined(CONFIG_USB_HOST)
+#include "usb/usbh/x360audio/x360_audio.h"
+#endif
 #if defined(CONFIG_GC2USB) || (CFG_TUD_VENDOR && defined(CONFIG_JOYBUS_BRIDGE))
 #include "hardware/gpio.h"  // gpio_get for JOYPIN?/GBADETECT diagnostics (RP2040 only)
 #endif
@@ -75,6 +78,33 @@ void cdc_init(void)
     // Let an optional relay module (e.g. MouthPad NUS<->CDC) attach itself.
     cdc_relay_late_init();
 }
+
+#if CFG_TUH_X360_AUDIO && defined(CONFIG_USB_HOST)
+// Parse hex bytes from a CDC argument: contiguous ("080300") or
+// space/comma separated ("08 03 00"). Returns byte count, or -1 on error.
+static int cdc_parse_hex(const char* s, uint8_t* out, int max)
+{
+    int n = 0;
+    int hi = -1;
+    for (; *s; s++) {
+        char c = *s;
+        int v;
+        if (c == ' ' || c == ',' || c == '\t') continue;
+        if (c >= '0' && c <= '9') v = c - '0';
+        else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+        else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+        else return -1;
+        if (hi < 0) {
+            hi = v;
+        } else {
+            if (n >= max) return -1;
+            out[n++] = (uint8_t)((hi << 4) | v);
+            hi = -1;
+        }
+    }
+    return (hi < 0) ? n : -1; // odd number of digits is an error
+}
+#endif
 
 // Process a complete command line
 static void cdc_process_command(const char* cmd)
@@ -532,6 +562,86 @@ static void cdc_process_command(const char* cmd)
                  d.last_rx[0], d.last_rx[1], d.last_rx[2],
                  d.last_rx[3], d.last_rx[4]);
         cdc_data_write_str(response);
+    }
+#endif
+#if CFG_TUH_X360_AUDIO && defined(CONFIG_USB_HOST)
+    // Xbox 360 headset-audio diagnostics (docs/protocols/xbox360_headset.md).
+    //   X360?            - active device + frame counters + last mic frame
+    //   X360CFG=<hex>    - send config bytes on if1 config OUT (0x03)
+    //   X360PHONE=<hex>  - send one 32-byte phone frame on 0x02
+    //   X360INIT         - replay the documented headset init/probe sequence
+    else if (strcmp(cmd, "X360?") == 0) {
+        uint8_t d = x360_audio_active_addr();
+        if (d == 0) {
+            cdc_data_write_str("x360audio: no active device\r\n");
+        } else {
+            uint8_t frame[X360_AUDIO_FRAME_SIZE];
+            bool have = x360_audio_last_mic_frame(d, frame);
+            snprintf(response, sizeof(response),
+                     "x360audio: d=%u mic=%lu status=%lu last_mic=%02x%02x%02x%02x\r\n",
+                     (unsigned)d,
+                     (unsigned long)x360_audio_mic_frame_count(d),
+                     (unsigned long)x360_audio_status_frame_count(d),
+                     have ? frame[0] : 0, have ? frame[1] : 0,
+                     have ? frame[2] : 0, have ? frame[3] : 0);
+            cdc_data_write_str(response);
+        }
+    }
+    else if (strncmp(cmd, "X360CFG=", 8) == 0) {
+        uint8_t buf[X360_AUDIO_FRAME_SIZE];
+        int n = cdc_parse_hex(cmd + 8, buf, sizeof(buf));
+        uint8_t d = x360_audio_active_addr();
+        if (d == 0) cdc_data_write_str("ERR: x360audio not active\r\n");
+        else if (n <= 0) cdc_data_write_str("ERR: bad hex\r\n");
+        else {
+            bool ok = x360_audio_queue_config(d, buf, (uint16_t)n);
+            snprintf(response, sizeof(response), "%s: X360CFG %d bytes queued\r\n",
+                     ok ? "OK" : "ERR", n);
+            cdc_data_write_str(response);
+        }
+    }
+    else if (strncmp(cmd, "X360PHONE=", 10) == 0) {
+        uint8_t buf[X360_AUDIO_FRAME_SIZE];
+        int n = cdc_parse_hex(cmd + 10, buf, sizeof(buf));
+        uint8_t d = x360_audio_active_addr();
+        if (d == 0) cdc_data_write_str("ERR: x360audio not active\r\n");
+        else if (n != X360_AUDIO_FRAME_SIZE) {
+            snprintf(response, sizeof(response),
+                     "ERR: phone frame must be %d bytes (got %d)\r\n",
+                     X360_AUDIO_FRAME_SIZE, n);
+            cdc_data_write_str(response);
+        } else {
+            bool ok = x360_audio_send_phone(d, buf, (uint16_t)n);
+            snprintf(response, sizeof(response), "%s: X360PHONE sent\r\n",
+                     ok ? "OK" : "ERR");
+            cdc_data_write_str(response);
+        }
+    }
+    else if (strcmp(cmd, "X360INIT") == 0) {
+        uint8_t d = x360_audio_active_addr();
+        if (d == 0) {
+            cdc_data_write_str("ERR: x360audio not active\r\n");
+        } else {
+            // Documented headset-attach frames (xboxdrv PROTOCOL), replayed as
+            // a probe: whether the host must send them is still UNKNOWN.
+            static const uint8_t init[][5] = {
+                { 0x00, 0x04, 0x01, 0x00, 0x00 },
+                { 0x01, 0x03, 0x00, 0x00, 0x00 },
+                { 0x02, 0x03, 0x0F, 0x00, 0x00 },
+                { 0x03, 0x05, 0xFF, 0x00, 0x00 },
+                { 0x04, 0x03, 0xFF, 0x00, 0x00 },
+                { 0x05, 0x03, 0x00, 0x00, 0x00 },
+            };
+            static const uint8_t init_len[] = { 4, 3, 3, 5, 3, 3 };
+            int queued = 0;
+            for (int i = 0; i < 6; i++) {
+                if (x360_audio_queue_config(d, init[i], init_len[i])) queued++;
+                else break;
+            }
+            snprintf(response, sizeof(response),
+                     "OK: X360INIT queued %d/6 frames\r\n", queued);
+            cdc_data_write_str(response);
+        }
     }
 #endif
     // Unknown command

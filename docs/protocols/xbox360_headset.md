@@ -177,3 +177,20 @@ Measurement plan (diagnostic mode, driver in `src/usb/usbh/x360audio/`):
 4. Record bytes with headset out vs plugged in; classify frames.
 5. (Later) decode 0x82 payload as G.726 right-packed 16 kHz to validate codec
    hypothesis; encode 0x02 at 8 kHz and confirm headset produces sound.
+
+### Runtime probe commands (CDC, `usb2usb` host builds)
+
+On a host build with a CDC port (e.g. `make usb2usb_rp2350usba`) the serial
+console accepts these commands; responses use the `x360audio:` prefix:
+
+| Command | Action |
+|---|---|
+| `X360?` | active device addr + mic/status frame counters + first 4 bytes of last mic frame |
+| `X360CFG=<hex>` | queue config bytes for the 0x03 OUT endpoint (`08 03 00` or `080300`) |
+| `X360PHONE=<hex>` | send one 32-byte phone frame on 0x02 (rejected unless exactly 32 bytes) |
+| `X360INIT` | replay the section-4 headset-attach sequence on 0x03 as a probe |
+
+Probe procedure: run `X360?`, confirm `mic=`/`status=` are incrementing, then
+plug/unplug the headset and watch those counters plus the if0 traffic change;
+finally run `X360INIT` and `X360?` again to see whether the controller replies
+on 0x83.

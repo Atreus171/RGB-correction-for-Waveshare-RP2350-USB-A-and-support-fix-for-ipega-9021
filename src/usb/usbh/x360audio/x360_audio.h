@@ -29,6 +29,9 @@ void x360_audio_task(void);
 // True once interface 1 of dev_addr has been claimed and configured.
 bool x360_audio_is_active(uint8_t dev_addr);
 
+// First device with a claimed audio interface, or 0 if none (for CDC probes).
+uint8_t x360_audio_active_addr(void);
+
 // Diagnostic counters / last-frame accessors.
 uint32_t x360_audio_mic_frame_count(uint8_t dev_addr);
 uint32_t x360_audio_status_frame_count(uint8_t dev_addr);
@@ -36,6 +39,10 @@ bool x360_audio_last_mic_frame(uint8_t dev_addr, uint8_t buf[X360_AUDIO_FRAME_SI
 
 // Send a config/status probe on the 0x03 OUT endpoint. len <= X360_AUDIO_FRAME_SIZE.
 bool x360_audio_send_config(uint8_t dev_addr, uint8_t const* cmd, uint16_t len);
+
+// Enqueue a config/status probe on the 0x03 OUT endpoint. Drained one frame at
+// a time by x360_audio_task() (safer than send_config for multi-frame scripts).
+bool x360_audio_queue_config(uint8_t dev_addr, uint8_t const* cmd, uint16_t len);
 
 // Send a raw frame on the 0x02 OUT (phone) endpoint. len must be 32.
 bool x360_audio_send_phone(uint8_t dev_addr, uint8_t const* frame, uint16_t len);
