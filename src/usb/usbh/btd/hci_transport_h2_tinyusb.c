@@ -68,6 +68,10 @@ typedef struct {
 } hci_usb_state_t;
 
 static hci_usb_state_t usb_state;
+// Starting BTstack from inside TinyUSB's class set_config callback can make
+// the first HCI command contend with the still-active USB configuration
+// control transfer. Defer it until tuh_task() has returned to usbh_task().
+static bool btstack_power_on_pending;
 
 #if USE_BTSTACK
 // Data source for BTstack run loop integration
@@ -350,6 +354,15 @@ static void hci_transport_h2_process_data_source(btstack_data_source_t *ds,
 
 void hci_transport_h2_tinyusb_process(void)
 {
+#if USE_BTSTACK
+    if (btstack_power_on_pending) {
+        btstack_power_on_pending = false;
+        printf("[HCI_USB] USB configuration complete; powering on BTstack\n");
+        extern void btstack_host_power_on(void);
+        btstack_host_power_on();
+    }
+#endif
+
     // Deliver any received event packets
     if (usb_state.evt_ready && usb_state.packet_handler) {
         usb_state.evt_ready = false;
@@ -393,6 +406,18 @@ void hci_transport_h2_tinyusb_process(void)
         // After delivering ACL, trigger BTstack to process (GATT notifications, etc.)
         btstack_run_loop_embedded_execute_once();
 #endif
+    }
+
+    // A transient endpoint error must not permanently stop HCI reception.
+    // The transfer callback clears the corresponding pending flag on error;
+    // retry from task context rather than submitting again from the callback.
+    if (usb_state.opened) {
+        if (!usb_state.evt_pending && !usb_state.evt_ready) {
+            usb_submit_event_transfer();
+        }
+        if (!usb_state.acl_in_pending && !usb_state.acl_ready) {
+            usb_submit_acl_in_transfer();
+        }
     }
 
 #if !USE_BTSTACK
@@ -758,6 +783,7 @@ bool btstack_driver_init(void)
     // Preserve packet_handler - BTstack's hci_init() may have set it before TinyUSB init
     void (*saved_handler)(uint8_t, uint8_t*, uint16_t) = usb_state.packet_handler;
     memset(&usb_state, 0, sizeof(usb_state));
+    btstack_power_on_pending = false;
     usb_state.packet_handler = saved_handler;
     printf("[HCI_USB] Driver initialized (handler=%p)\n", (void*)saved_handler);
     return true;
@@ -765,6 +791,7 @@ bool btstack_driver_init(void)
 
 bool btstack_driver_deinit(void)
 {
+    btstack_power_on_pending = false;
     usb_state.connected = false;
     usb_state.opened = false;
     return true;
@@ -885,15 +912,20 @@ bool btstack_driver_set_config(uint8_t dev_addr, uint8_t itf_num)
     usb_state.connected = true;
     printf("[HCI_USB] Bluetooth dongle configured\n");
 
-    // Signal usbh layer that BT hardware is present (enables BTstack loop)
+    // Finish TinyUSB configuration before BTstack attempts its first HCI
+    // command on EP0. In particular, CSR clones are prone to losing HCI Reset
+    // if it is submitted while the configuration walker is still active.
+    usbh_driver_set_config_complete(dev_addr, itf_num);
+    printf("[HCI_USB] TinyUSB configuration marked complete\n");
+
+    // Signal usbh layer that BT hardware is present (enables BTstack loop).
+    // The next usbh_task() pass performs the deferred power-on.
     extern void usbh_set_bt_available(bool available);
     usbh_set_bt_available(true);
 
 #if USE_BTSTACK
-    // Now that dongle is connected, power on BTstack
-    printf("[HCI_USB] Powering on BTstack...\n");
-    extern void btstack_host_power_on(void);
-    btstack_host_power_on();
+    btstack_power_on_pending = true;
+    printf("[HCI_USB] BTstack power-on queued\n");
 #else
     // Standalone test mode - auto-init and send HCI Reset
     hci_transport_h2_tinyusb_test_init();
@@ -905,11 +937,6 @@ bool btstack_driver_set_config(uint8_t dev_addr, uint8_t itf_num)
     // Send HCI_Reset to verify communication
     hci_transport_h2_tinyusb_test_reset();
 #endif
-
-    // TinyUSB's application-driver configuration walker does not advance
-    // automatically. Without this call the device remains stuck in the
-    // configuring state and the mount callback is never reached.
-    usbh_driver_set_config_complete(dev_addr, itf_num);
 
     return true;
 }
