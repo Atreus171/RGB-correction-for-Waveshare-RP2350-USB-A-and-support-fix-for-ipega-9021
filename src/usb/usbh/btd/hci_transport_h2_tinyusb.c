@@ -778,9 +778,13 @@ bool btstack_driver_open(uint8_t rhport, uint8_t dev_addr,
     // Check if this is a Bluetooth device
     // Standard BT class: 0xE0/0x01/0x01
     // Some Broadcom dongles use vendor-specific class: 0xFF/0x01/0x01
-    bool is_standard_bt = (desc_itf->bInterfaceClass == USB_CLASS_WIRELESS_CTRL &&
-                           desc_itf->bInterfaceSubClass == USB_SUBCLASS_RF &&
-                           desc_itf->bInterfaceProtocol == USB_PROTOCOL_BLUETOOTH);
+    // Only interface 0 carries HCI commands/events/ACL. CSR and other standard
+    // dongles commonly expose interface 1 for SCO audio; claiming it here would
+    // bind the HCI driver to isochronous endpoints it does not implement.
+    bool is_standard_bt = (desc_itf->bInterfaceNumber == 0 &&
+                            desc_itf->bInterfaceClass == USB_CLASS_WIRELESS_CTRL &&
+                            desc_itf->bInterfaceSubClass == USB_SUBCLASS_RF &&
+                            desc_itf->bInterfaceProtocol == USB_PROTOCOL_BLUETOOTH);
 
     uint16_t vid, pid;
     tuh_vid_pid_get(dev_addr, &vid, &pid);
@@ -800,7 +804,12 @@ bool btstack_driver_open(uint8_t rhport, uint8_t dev_addr,
         return true;
     }
 
-    printf("[HCI_USB] Bluetooth dongle found at addr %d\n", dev_addr);
+    printf("[HCI_USB] Bluetooth dongle found at addr %d VID=%04X PID=%04X",
+           dev_addr, vid, pid);
+    if (vid == USB_VID_CSR && pid == USB_PID_CSR_HCI) {
+        printf(" (CSR HCI 0A12:0001)");
+    }
+    printf("\n");
 
     usb_state.dev_addr = dev_addr;
     usb_state.itf_num = desc_itf->bInterfaceNumber;
@@ -896,6 +905,11 @@ bool btstack_driver_set_config(uint8_t dev_addr, uint8_t itf_num)
     // Send HCI_Reset to verify communication
     hci_transport_h2_tinyusb_test_reset();
 #endif
+
+    // TinyUSB's application-driver configuration walker does not advance
+    // automatically. Without this call the device remains stuck in the
+    // configuring state and the mount callback is never reached.
+    usbh_driver_set_config_complete(dev_addr, itf_num);
 
     return true;
 }

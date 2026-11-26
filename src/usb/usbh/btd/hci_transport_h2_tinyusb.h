@@ -103,6 +103,8 @@ const hci_transport_t* hci_transport_h2_tinyusb_instance(void);
 
 // Vendor IDs for dongles that use vendor-specific class instead of standard BT class
 #define USB_VID_BROADCOM            0x0A5C
+#define USB_VID_CSR                 0x0A12
+#define USB_PID_CSR_HCI             0x0001
 
 // Bluetooth chip manufacturer IDs (from hci_get_manufacturer())
 #define BT_MANUFACTURER_CSR         0x000A  // Cambridge Silicon Radio
