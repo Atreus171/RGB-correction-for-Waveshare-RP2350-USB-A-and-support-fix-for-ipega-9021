@@ -6,7 +6,290 @@ Format based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
-## [2.4.1] — 2026-08-15
+## [Unreleased]
+
+### Added
+#### universal — dedicated BLE keyboard, mouse, and keyboard+mouse modes
+- **Three new BLE output modes that declare only what they are:** `Keyboard+Mouse BLE`,
+  `Keyboard BLE`, and `Mouse BLE`. Standard puts keyboard, mouse and gamepad in one HID
+  service, which macOS turns into a single gamepad-primary device that never dispatches its
+  keyboard/pointer collections; SInput works around that with a second HID service, but on
+  **iOS only the keyboard/mouse half dispatches at all** — the gamepad is dead weight there.
+  These modes advertise the correct appearance (keyboard `0x03C1`, mouse `0x03C2`), carry their
+  own PnP ID, and drop any report their descriptor does not declare, so a host never claims the
+  device as a controller when it is being used as a keyboard or a pointer. The web config picks
+  them up automatically.
+
+#### universal — each BLE output mode is its own device to the host
+- **Switching BLE modes no longer needs "Forget This Device".** Hosts cache a bonded peer's
+  GATT database against its address, and every mode used to advertise from the same one — so a
+  mode switch handed the host a new report map under an identity it had already cached. Each
+  mode now advertises from its own address, derived deterministically from the board id, so it
+  is identical across reboots, reflashes and mode switches: one permanent bond per mode, and
+  switching back reconnects to the right one. Switch 2 keeps its public Nintendo address, which
+  the console bonds to.
+- **LED colours are now one per function** and aligned with the USB table (SInput white,
+  keyboard+mouse yellow, Xbox green, Switch red), using all seven combinations the
+  discrete-GPIO boards can actually distinguish.
+
+#### universal — the BLE device output can be turned off
+- **`ROUTER.SET {"ble_output": false}`**, plus a toggle on the web config Bluetooth page, stops
+  the adapter being a BLE peripheral at all — for a board configured purely as a receiver, which
+  previously had no way to avoid being a peripheral and a central at the same time. With the
+  Bluetooth host disabled too, BTstack is never started. `CAPS.GET` reports a `bt_device` block
+  mirroring `bt_host`, so the UI can tell "compiled in" from "user-settable".
+
+#### Diagnostics
+- **`BT.CTRL`** reports the Bluetooth controller's HCI/LMP version and manufacturer plus the
+  address actually being advertised from. HCI init finishes long before a CDC client can attach,
+  so none of this was previously observable.
+- **`BT.STATUS`** gains the two scan-suppression flags, so "not scanning" can be told apart from
+  "suppressed".
+
+
+#### universal — SInput BLE carries gamepad + keyboard + mouse
+- **One BLE device is now a controller, keyboard, and mouse at once.** In SInput BLE mode the
+  adapter exposes the SInput gamepad alongside a full keyboard (modifiers + 6 keys) and mouse
+  (5 buttons, 16-bit X/Y, wheel, pan), so `MOUSE.INJECT`/`KEY.INJECT` and real mice/keyboards
+  come out over the air as well as over USB. Verified end to end on macOS on the Makerdiary
+  nRF52840 dongle: SInput reports, cursor motion, and key/modifier state all at the same time.
+  This removes the reason the Standard BLE combo mode existed. **Hosts paired before this
+  change need Forget + re-pair** once, to pick up the new GATT layout.
+- **Mouse & Keyboard test on the web config Input Test page** — drag pad, wheel, click buttons,
+  and a key/modifier panel driving `MOUSE.INJECT`/`KEY.INJECT`.
+
+### Fixed
+
+#### BLE host (central)
+- 🔴 **The central could go permanently deaf after one failed reconnect.** The BLE connect
+  timeout only fires while the state is `CONNECTING`, and the idle safety net that resumes
+  scanning only fires once the connect timestamp is clear — so any path that left `CONNECTING`
+  without clearing it wedged both, and scanning stopped for good. A bonded controller was then
+  never discovered again: it read as "pairs but never fully connects", and only a manual
+  `BT.SCAN` recovered it. Found with a Stadia controller on a receiver-mode dongle.
+- **A receiver never discovered a controller put into pairing mode later.** Scanning was
+  time-boxed to 60 s at boot, after which only the already-bonded address was dialled. With the
+  BLE peripheral disabled there is nothing for scanning to starve, so receiver mode now scans
+  continuously; dual-role builds keep the time box, because concurrent scanning does starve our
+  own advertising.
+- **The LED ignored the central.** With no wireless device role, "connected" was computed from
+  the output link — so it effectively meant "USB is plugged in" rather than "a controller is
+  linked". It now follows the central: solid once a controller connects, blinking only while
+  scanning with none.
+
+#### nRF52840
+- **Every BLE advertisement did a blocking `printf` from the BTstack thread.** The live btdiag
+  filter matched all `0xE03E` LE meta events as "low-rate", but subevent `0x02` is one report
+  per advertisement seen — so while scanning it buried every useful log line and stalled the
+  cooperative BTstack thread on a polled UART, during exactly the window where connection setup
+  is timing-sensitive. Ring-only now.
+
+#### Switch 2 BLE output
+- **The Nintendo public address could not be claimed on a Pico W.** pico-sdk's CYW43 transport
+  sets its own BD_ADDR from inside `hci_power_control(HCI_POWER_ON)`, overwriting anything set
+  beforehand — so the vendor command went out carrying the OTP address and succeeded, making it
+  look as though the radio had refused it. It is claimed from the init sequence instead. On nRF a
+  fourth writer (`ZEPHYR_READ_STATIC_ADDRESS`) arrives last and installed the controller's own
+  static address over ours; it now yields.
+- **A console that connected and then went silent made the adapter invisible forever.** We stop
+  advertising while connected, and nothing tore down a dead peripheral link — `BLE.DROP` walks
+  only the central's table. A stall watchdog now drops such a link and goes back on air, and
+  self-heals when the disconnect request is ignored.
+- **`att_w` counted disconnect cleanup as a console write**, which made a console that never
+  touched our GATT look as though it had.
+- **Pico W cannot act as a Switch 2 controller** — its CYW43 reports LE 2M PHY unsupported while
+  the nRF52840 that pairs has it. Documented in `.dev/docs/switch2-ble-pico-w-verdict.md` with
+  everything that was ruled out, so it does not get re-litigated.
+
+
+#### BLE output (universal)
+- 🔴 **BLE keyboard/mouse reports arrived but did nothing on macOS.** With the keyboard and mouse
+  collections inside the gamepad's report map, macOS built one HID device whose primary usage
+  was Gamepad and never dispatched its keyboard/pointer collections — hidapi saw every report,
+  yet the cursor and keys never moved. Keyboard + mouse now live in a **second HID service
+  instance**, which macOS enumerates as its own keyboard/mouse device (mirroring the USB build's
+  separate interfaces) while the gamepad stays claimed as a controller for SDL/Steam.
+- 🔴 **The central role could wreck the host's bond.** On a dual-role build, the BLE central's
+  "re-encryption failed → delete bond and re-pair" recovery also ran on the *peripheral* link
+  (a Mac connecting to us), deleting that host's bond mid-connection and corrupting the link's
+  security. The central's SM handlers now act only on links the central created.
+- **System Settings pairing left the device "paired but Not Connected."** A security request
+  sent on connect raced the host's own pairing agent; macOS completed pairing, then dropped the
+  link and discarded the keys, re-pairing from scratch on every retry. Removed — the encrypted
+  report characteristics already make hosts pair on demand.
+- **Injected keystrokes went out as empty BLE keyboard reports.** The BLE keyboard encoder read
+  only the legacy packed key field, which `KEY.INJECT` doesn't fill; it now reads the dedicated
+  modifier/keycode fields first.
+
+#### nRF52840
+- 🔴 **Sustained BLE sends hard-hung the dongle** (USB gone, no fault crumb, replug only — ~4 s
+  at 30 Hz mouse input). The cross-thread send marshal inserted into the BTstack run loop's
+  callback list without masking interrupts; the cooperative BTstack thread could preempt the
+  insert and leave the list circular. The insert is now interrupt-guarded.
+
+#### Web config
+- **Virtual mouse/keyboard never appeared as Input Test sources**, and **mouse-pad drags never
+  sent** (the pointer-capture gate swallowed every move) — both fixed.
+
+---
+
+## [2.5.0] — 2026-09-20
+
+Feature release. Three new output frontiers — PlayStation 5 (native USB, dongle-authenticated, and
+over WiFi Remote Play), Nintendo Switch over Bluetooth Classic, and the first radio input source —
+plus the `controller_btusb` app grown up and renamed `universal`, with runtime control over which
+outputs carry input.
+
+### Added
+
+#### wifi2usb → PS Remote Play (usb2wifi, Pico W / Pico 2 W)
+- **Play a real PS5/PS4 over WiFi — no PC, no phone, no DualSense.** The adapter now runs a
+  Remote Play session engine (ported from the chiaki protocol work) directly on the Pico W:
+  on-device PSN OAuth sign-in, LAN console discovery with auto-filled IPs, on-device pairing
+  (registration handshake), rest-mode wakeup before connecting, and a full streaming session with
+  keep-alive heartbeat and congestion reporting so the console holds the link. Controller input is
+  delivered as Remote Play feedback history — buttons, D-pad, sticks, and the touchpad surface +
+  click all pass through, with edge resends so lossy UDP can't stick a button. The session is
+  strictly opt-in (Start/Stop in web config), tears down with a proper DISCONNECT so the console
+  frees its slot, backs off when the console is busy, and reconnects stickily to the last console
+  across IP changes. Web config grew WiFi and PlayStation cards: network scan with real signal
+  bars, a unified console list with inline link/pair, and live session state.
+
+#### DualSense and native PS5 output
+- **DualSense USB output mode.** Byte-real DualSense descriptors (enumerates as a DualSense on
+  macOS), full input report with motion and touch, and console feedback relayed back to the
+  physical pad: rumble, lightbar RGB, and player-LED-to-player-number. Gyro/accel stream at full
+  rate.
+- **P5General native PS5 output.** A dongle-authenticated PS5 mode that answers the console's
+  auth through a P5General dongle, including on the dual-RP2040 remapper via a cross-chip auth
+  bridge; PS5 rumble, player LED, and lightbar relay back to the connected controller.
+
+#### Switch Pro over Bluetooth Classic (universal, Pico W / Pico 2 W)
+- **The adapter can now BE a Pro Controller.** A clean-room Switch Pro protocol engine (SPI flash
+  emulation included) on BTstack's Classic HID-device role: console sync via the user button,
+  bonds kept across boots, auto-reconnect by paging the console, registers and streams end-to-end
+  on real hardware. Selectable as a wireless output mode alongside SInput BLE and Xbox BLE.
+
+#### 24g2usb
+- **First radio input source: 8BitDo SF30 2.4G wireless receiver over nRF24L01+.** New `24g2usb`
+  app drives an nRF24L01+ over SPI, impersonating the SF30 2.4G's OEM USB dongle closely enough
+  that controllers pair and cold-link directly — no 8BitDo dongle needed. The receiver runs off
+  the radio's IRQ line and a hardware alarm rather than the main polling loop, so other core-0
+  work (flash writes, LED updates) can't stall a dwell and drop a packet. Supports exactly one
+  controller by design. Hold BOOTSEL ~1.5s to pair. Boards: Pico 2 W, Pico W, Pico, Pico 2,
+  Waveshare RP2350-Zero — plus nRF24L01+ carrier PCBs for RP2350-Zero and Pico 2 W in the new
+  generated-KiCad `hardware/` tree. See [24g2usb](docs/apps/24g2usb.md), [24G input](docs/input/24g.md),
+  and the [24G protocol reference](docs/protocols/24g.md) (recovered by logic-analyser capture of
+  the OEM dongle's SPI bus).
+
+#### universal (BLE output overhaul)
+- **Runtime USB/BLE output policy.** New `WIRELESS.POLICY` setting (web config: USB / BLE
+  Priority on the BT Output page): **Both** (default) sends input to USB and BLE together; **USB
+  dominant** routes input only to USB while a USB host is connected; **BLE dominant** routes only
+  to BLE while a BLE host is subscribed. Dominance is pure routing — the idle side stays
+  connected/enumerated (web config keeps working), a neutral report is sent on the switch so
+  nothing sticks, and changes apply live with no reboot.
+- **Xbox BLE mode registers as a real controller now.** The mode advertised a Series X identity
+  with a One-S-style report map, and its GATT database declared the wrong input report ID — hosts
+  either rejected the pad or silently dropped every report. It now carries the byte-exact Series X
+  descriptor (input report ID 1, PnP version 0x0509) and SDL/Gamepad-API hosts enumerate it as an
+  Xbox Series X Controller. Descriptor changes require forget + re-pair on previously bonded hosts.
+- **SInput BLE is the default wireless mode; Standard BLE is retired from the selector** (the code
+  remains behind `CONFIG_BLE_STANDARD_MODE` for custom branches). An explicitly chosen BLE mode
+  now persists across reboots instead of being reset to the app default.
+
+#### New hardware and input drivers
+- **Makerdiary nRF52840 MDK USB Dongle** support for `bt2usb` and `universal` (dual UF2
+  bootloaders, static partition layout so settings never land on bootloader flash).
+- **usb2neogeo_te** tournament-edition app (#175), including Pico 2 wiring.
+- **Intel Wireless Series receiver (8086:C013)** USB host driver.
+- **8BitDo SN30/SF30 Pro USB D-Input (2dc8:6001)** dedicated driver — the generic parser dropped
+  a face button on these pads; plus a generic-parser spillover net so a >12th button is never
+  dropped on any controller.
+- **Joy-Con merge with per-event field ownership**, so paired halves stop fighting over axes.
+
+#### Dual-RP2040 remapper (remapper_v7)
+- **Relay-free B-side flashing**: chip A auto-flashes chip B's image over SWD on boot
+  (`combine_uf2` staging, watchdog-guarded, with progress reporting and a `FLASH.B` CDC command);
+  BOOT button mode-switching and full feedback (rumble/LED), touch + motion forwarding, and BT
+  dongle input across the link.
+- **DS4/PS4 auth relayed across the link** — the missing CRC32 on the nonce sent *to* the DS4 was
+  why consoles rejected the signature; initial auth now completes on a real PS4.
+
+#### Core
+- **IMU normalization**: gyro/accel from every motion-capable input are normalized to the SDL
+  canonical sensor frame in core (per-controller transforms, declared ranges), so SInput and
+  DualSense outputs agree on axes.
+- **INPUT.INJECT can drive analog axes**, the web config Input Test row can drive real output,
+  and injected input flushes on release so nothing sticks — the base for CDC-driven assistive
+  input (decode intent in software, emit real USB/BLE HID from the adapter).
+- **MOUSE.INJECT and KEY.INJECT: the whole computer over CDC.** New commands synthesize real
+  pointer and keyboard input from the config host: `MOUSE.INJECT {dx,dy,wheel,buttons}` is
+  one-shot like a physical mouse report; `KEY.INJECT {mod,keys[]}` is held-state (send `{}` to
+  release). Events route through the router like a physical mouse/keyboard and come out the
+  SInput composite's mouse and keyboard interfaces — an assistive front-end can now drive the
+  cursor, type, and press gamepad buttons on any OS with no drivers or permissions, because the
+  host just sees a real HID device. HW-verified on macOS (cursor deltas, modifier and key state).
+  Three latent routing bugs fixed on the way: pure keyboard events never reached the SInput
+  keyboard interface (only the MouthPad mouse path sent them); MERGE mode never registered a
+  keyboard-only device (its first press was dropped); and blend/priority merging corrupted
+  typed events entirely — mouse/keyboard events now bypass the gamepad merge and publish
+  straight through. The gamepad INPUT.INJECT overlay is also type-gated so it can no longer
+  fabricate clicks on a passing mouse event.
+
+### Fixed
+
+#### Router
+- 🔴 **Cross-core output handoff is tear-free.** Core 1 (console protocols) could read a
+  half-written input event from Core 0 — a seqlock now guarantees a coherent snapshot, bounded so
+  the timing-critical core never stalls.
+- **The BLE send paths can no longer lose a consume-once router event.** A press→release inside
+  one connection interval dropped the release forever (stuck button over BLE); every path now
+  coalesces into the queued report instead of dropping.
+- **Cycle-D-pad-mode hotkey covers all four modes** instead of skipping the 4th and mis-wrapping.
+
+#### BLE on nRF52840 / ESP32
+- 🔴 **Pairing or the first HID report could hard-crash the dongle.** BLE sends from the app main
+  loop raced the BTstack thread for the single HCI TX buffer (assert → dead until power cycle);
+  sends are now marshalled onto the BTstack run loop. USB-dominance enforcement also disconnected
+  mid-pairing, hard-resetting the controller — dominance is now routing-only and never touches
+  the link.
+- 🔴 **`ROUTER.GET` over CDC could kill the nRF dongle** — 3 kB of frame buffers on the Zephyr
+  main stack overflowed it; buffers are static now.
+- **macOS 26 stale-persona fix**: a fast USB mode-switch reboot re-enumerated before the host
+  dropped the old device state and CDC-only mode never configured; the device now detaches and
+  dwells 600 ms before rebooting.
+
+#### PlayStation auth
+- **PS4 auth key install verifies flash before reporting success** (a failed write no longer
+  claims the key is installed).
+- **DualSense over BT binds correctly** — PnP SDP is queried on the hid_host path so the DS5 is
+  recognized before the report map is interpreted.
+
+#### Build & platforms
+- **Firmware INFO reports the real commit on CI builds** (was "unknown" on every release).
+- **Waveshare RP2350B boards use the SDK's real package switch** (fixes the B-package 2350).
+- **Controller app display flush is incremental/async**, so OLED updates no longer stall the
+  input loop.
+
+### Changed
+
+- **`controller_btusb` renamed to `universal`.** The app outgrew its name: it's now the universal
+  configurable adapter — GPIO/sensor/BT inputs, BLE + USB outputs, runtime mode and
+  wireless-policy selection via web config. All build targets follow (`make universal_pico_w`,
+  `universal_rp2040_abb`, nRF/ESP32 `APP_TYPE=universal`, `nrf/prj_universal.conf`). Historic
+  CHANGELOG entries keep the old name.
+- **Release UF2s are named `joypad_os_<version>_<app>_<board>.uf2`** (was `joypad_`), and GitHub
+  releases are titled **JoypadOS vX.Y.Z**.
+- **Web config identifies itself**: a build stamp (source commit · date) in the sidebar footer.
+- **CI**: open PRs get build-only runs with per-PR concurrency; every app target must be shipped
+  or explicitly excluded (build-coverage guard); driver-registry check keeps backend source lists
+  in sync; per-app artifact retention bounded to 14 days; the Makerdiary nRF jobs build against
+  the real Zephyr board name.
+
+---
+
+## [2.4.1] — 2026-08-16
 
 Patch release. **Every adapter running 2.4.0 should update**: the universal profile hotkeys added in
 2.4.0 made a long-standing settings-corruption bug reachable on 43 of the 45 apps, from a gesture the
@@ -38,6 +321,14 @@ Patch release. **Every adapter running 2.4.0 should update**: the universal prof
   USB HID gamepad path submits nothing during a static hold, so the timer cannot advance mid-hold on
   those pads). A quick tap reaches neither and passes through. Apps with their own combo tables are
   unaffected. (#243)
+- **…and the hold now belongs to the controller that started it.** The combo table has one hold
+  timer per combo, not one per device, and every input event from every device ran through it — so
+  on any adapter with two or more controllers connected, a second player simply playing the game
+  cleared player 1's timer on each of their own events. The hold could never reach 0.7 s and all
+  five built-in hotkeys were unreachable; single-controller testing passes either way. The timer now
+  records which device opened it and ignores everyone else's events. Disconnecting a pad mid-hold
+  also clears its timer, instead of leaving a stale timestamp that fired the next press instantly.
+  (#249)
 - **D-pad mode 3 (L-stick ↔ R-stick) survives a reboot.** The 4th position of 2.4.0's D-pad slider
   applied live but was rejected by the flash setter, so it silently reset on every power cycle.
   (#242)
@@ -81,21 +372,48 @@ Patch release. **Every adapter running 2.4.0 should update**: the universal prof
   change?" test looked only at finger 1 — and on DS4 only at its coordinates, not its down bit — so
   lifting the second finger, or a finger whose coordinates hadn't moved, produced no new report and
   the touch point stayed active. Both fingers' down bit and position are now part of the diff.
+- **Factory reset erases Bluetooth bonds too.** `SETTINGS.RESET` erased only the settings sector,
+  but BLE and Classic bonds live in a separate flash bank and survived — contradicting `flash.h`,
+  which documents the call as erasing "all stored data (settings, bonds, pad config)". A factory
+  reset from the web config is now a genuine clean slate on BT builds.
+- **The web config's "Enable Bluetooth Host" toggle no longer reads *off* on adapters whose whole job
+  is Bluetooth.** `ROUTER.GET` reported the persisted `bt_input_enabled` flag on every build, but the
+  dedicated BT bridges (`bt2usb`, `bt2gc`, `bt2n64`, `bt2nuon`, `bt2loopy`, …) never read that flag —
+  they always run the radio. On a fresh flash the byte is zero, so config.joypad.ai showed Bluetooth
+  disabled on a board that was actively scanning for controllers. `CAPS.GET` now carries a `bt_host`
+  capability pair mirroring `usb_host` (*present* = the stack is compiled in, *configurable* = the app
+  honours the runtime flag), and always-on bridges report `bt_input: true` with a read-only toggle.
+  Only `controller_btusb` and `bt2wiiext` actually honour the flag, and both stay user-settable.
 
 ### Added
 
 - **iPega PG-9021 Classic Bluetooth gamepad driver**, wired into the RP2040, ESP32-S3 and nRF builds.
   (#239, thanks @Atreus171)
+- **First release UF2 for `controller_btusb` on the Seeed XIAO nRF52840.** v2.4.0 and every release
+  before it shipped no asset for that board — it had to be built from source. This release adds
+  `joypad_2.4.1_controller_btusb_seeed_xiao_nrf52840.uf2`, taking the release from 69 UF2s to 70.
+  (#219)
+
+### Changed
+
+- **`bt2usb` now defaults to SInput output, like every other adapter.** It was the only build that
+  overrode `USBD_DEFAULT_MODE`, left at PS4 from the PS4 local-auth work, so a blank board came up
+  as a DualShock 4 instead of an SInput pad. **If your bt2usb board has never had its output mode
+  changed, it will come up in SInput after this update** — triple-click BOOTSEL is still the way
+  back to SInput, and double-click still cycles. A board with a mode saved in flash is unaffected;
+  the saved mode still wins. This also means a fresh bt2usb board is reachable from
+  config.joypad.ai out of the box, which PS4 mode (no CDC interface) blocked.
 
 ### Build & CI
 
 - 🔴 **Released firmware reports its own version correctly again.** Every 2.4.0 UF2 self-reported
-  `2.3.0`, and every 2.3.0 UF2 reported `2.2.0` — in the web config, in the boot banner, and in the
-  USB device descriptor, so there was no surface on which a user could confirm which build they were
-  running. The release workflow bumped `VERSION` in a new commit but the build jobs did not depend on
-  that job, so they compiled the tree from just before the bump. The builds now check out the bump
-  commit, and the run fails outright if the tree being compiled does not carry the version being
-  released — the original failure produced no error at all, which is how it survived two releases.
+  `2.3.0` — in the web config, in the boot banner, and in the USB device descriptor, so there was no
+  surface on which a user could confirm which build they were running. The release workflow bumped
+  `VERSION` in a new commit but the build jobs did not depend on that job, so they compiled the tree
+  from just before the bump. The builds now check out the bump commit, and the run fails outright if
+  the tree being compiled does not carry the version being released — the original failure produced
+  no error at all, which is how it went unnoticed. **2.3.0 and 2.2.0 are unaffected**: both were
+  released with `VERSION` bumped in the repo beforehand, so there was no bump commit to miss.
   (#245, #246; thanks mitsuschi for the report)
 - Every driver the BTHID/device registries reference is now compiled, and CI fails if one is
   referenced but not built. (#233)
@@ -104,6 +422,14 @@ Patch release. **Every adapter running 2.4.0 should update**: the universal prof
 
 ### Documentation
 
+- 🔴 **Sixteen pages documented a profile-switch gesture that does not exist.** They instructed
+  *"hold Select for 2 seconds, then press D-Pad Up/Down"* — a two-step sequence nothing implements,
+  so a user who held Select, released it, and then pressed the D-pad got no response at all. The
+  real gesture is **SELECT + D-Pad Up/Down pressed together and held ~0.7 s**. Four of those pages
+  also had the direction inverted (Up is *previous*, Down is *next*), and every one of them said
+  "cycle" although the built-in hotkeys clamp at the ends instead of wrapping. The bt2usb build
+  guide separately claimed SELECT + D-Pad Left/Right does nothing on bt2usb — it is the D-pad
+  slider, live on every app that takes the default combos. (#253)
 - `app.h` manifests no longer advertise feature flags the build never reads — several of them stated
   the opposite of what the firmware does. (#198, #199)
 - **usb2gc build guide:** removed the dead GPIO 6 "console-presence sense wire" instruction, which
@@ -112,6 +438,8 @@ Patch release. **Every adapter running 2.4.0 should update**: the universal prof
 - **psx2usb:** LED claims scoped per board, config-tool pointer corrected, real button combos
   documented. (#240)
 - Build-guide controls, UF2 filenames and the output-mode cycle corrected across the guides. (#238)
+- **bt2usb build guide:** the three places it told users a fresh board comes up in PS4 mode now say
+  SInput, with a note for anyone updating from 2.4.0.
 
 ---
 

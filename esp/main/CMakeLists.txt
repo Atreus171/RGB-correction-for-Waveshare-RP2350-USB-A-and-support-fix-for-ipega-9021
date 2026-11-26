@@ -3,7 +3,7 @@
 # Compiles shared sources from ../../src/ alongside ESP32-specific code.
 # BTstack from pico-sdk submodule, TinyUSB device-only (our own copy, not esp_tinyusb).
 #
-# App selection: pass -DCONFIG_APP=controller_btusb (default: bt2usb)
+# App selection: pass -DCONFIG_APP=universal (default: bt2usb)
 
 set(SHARED_SRC "${CMAKE_CURRENT_LIST_DIR}/../../src")
 set(BTSTACK_PATH "${SHARED_SRC}/lib/pico-sdk/lib/btstack")
@@ -32,13 +32,13 @@ set(ESP32_COMMON_SRCS
 )
 
 # App-specific sources and config
-if(CONFIG_APP STREQUAL "controller_btusb")
+if(CONFIG_APP STREQUAL "universal")
     set(APP_SRCS
         "btstack_hal_esp32.c"
         "stubs_peripheral.c"
         "pad_config_storage_esp32.c"
         "platform_gpio_esp32.c"
-        "${SHARED_SRC}/apps/controller_btusb/app.c"
+        "${SHARED_SRC}/apps/universal/app.c"
         # Pad input + config (runtime GPIO pin config via web config)
         "${SHARED_SRC}/pad/pad_input.c"
         "${SHARED_SRC}/pad/pad_config_flash.c"
@@ -53,6 +53,9 @@ if(CONFIG_APP STREQUAL "controller_btusb")
         "${SHARED_SRC}/bt/ble_output/ble_output_xbox.c"
         "${SHARED_SRC}/bt/ble_output/ble_nus.c"
         "${SHARED_SRC}/bt/ble_output/ble_xbox_gatt_db.c"
+        # Switch 2 Pro Controller over BLE (CONFIG_SWITCH2_BLE_OUTPUT below)
+        "${SHARED_SRC}/bt/switch2_ble/switch2_proto.c"
+        "${SHARED_SRC}/bt/switch2_ble/switch2_ble.c"
         # BT transport (peripheral mode — no btstack_host, no bthid)
         "${SHARED_SRC}/bt/transport/bt_transport.c"
         "${SHARED_SRC}/bt/transport/bt_transport_esp32.c"
@@ -65,7 +68,7 @@ if(CONFIG_APP STREQUAL "controller_btusb")
         # Battery monitoring (I2C fuel gauge)
         "battery_esp32.c"
     )
-    set(APP_INCLUDE_DIR "${SHARED_SRC}/apps/controller_btusb")
+    set(APP_INCLUDE_DIR "${SHARED_SRC}/apps/universal")
     set(APP_NEEDS_BTSTACK ON)
     set(APP_BTSTACK_MODE "peripheral")
 
@@ -88,6 +91,7 @@ elseif(CONFIG_APP STREQUAL "usb2usb")
 
         # --- USB Host layer ---
         "${SHARED_SRC}/usb/usbh/usbh.c"
+        "${SHARED_SRC}/usb/usbh/intel/intel_wireless_series.c"
         "${SHARED_SRC}/usb/usbh/hid/hid.c"
         "${SHARED_SRC}/usb/usbh/hid/hid_registry.c"
         "${SHARED_SRC}/usb/usbh/hid/hid_utils.c"
@@ -104,6 +108,7 @@ elseif(CONFIG_APP STREQUAL "usb2usb")
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_m30.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_neo.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_pce.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_sn30.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/dragonrise/dragonrise.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/google/google_stadia.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/hori/hori_horipad.c"
@@ -120,6 +125,8 @@ elseif(CONFIG_APP STREQUAL "usb2usb")
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sega/sega_astrocity.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds3.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds4.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/ds5_auth.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/p5general_host.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds5.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_psc.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/valve/steam_controller_2.c"
@@ -160,6 +167,7 @@ elseif(CONFIG_APP STREQUAL "btusb2usb")
 
         # --- USB Host layer ---
         "${SHARED_SRC}/usb/usbh/usbh.c"
+        "${SHARED_SRC}/usb/usbh/intel/intel_wireless_series.c"
         "${SHARED_SRC}/usb/usbh/hid/hid.c"
         "${SHARED_SRC}/usb/usbh/hid/hid_registry.c"
         "${SHARED_SRC}/usb/usbh/hid/hid_utils.c"
@@ -176,6 +184,7 @@ elseif(CONFIG_APP STREQUAL "btusb2usb")
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_m30.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_neo.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_pce.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_sn30.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/dragonrise/dragonrise.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/google/google_stadia.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/hori/hori_horipad.c"
@@ -192,6 +201,8 @@ elseif(CONFIG_APP STREQUAL "btusb2usb")
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sega/sega_astrocity.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds3.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds4.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/ds5_auth.c"
+        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/p5general_host.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds5.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_psc.c"
         "${SHARED_SRC}/usb/usbh/hid/devices/vendors/valve/steam_controller_2.c"
@@ -254,6 +265,8 @@ set(SRCS
     "${SHARED_SRC}/usb/usbd/modes/psclassic_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/pcemini_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/ps4_mode.c"
+    "${SHARED_SRC}/usb/usbd/modes/dualsense_mode.c"
+    "${SHARED_SRC}/usb/usbd/modes/p5general_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/xid_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/xbone_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/xac_mode.c"
@@ -389,7 +402,7 @@ if(APP_NEEDS_BTSTACK)
         )
     endif()
 
-    # --- Peripheral mode (controller_btusb): GATT server + HID device ---
+    # --- Peripheral mode (universal): GATT server + HID device ---
     if(APP_BTSTACK_MODE STREQUAL "peripheral")
         list(APPEND SRCS
             # BTstack GATT server (att_server.c is in the BLE common block)
@@ -399,6 +412,10 @@ if(APP_NEEDS_BTSTACK)
             "${BTSTACK_PATH}/src/ble/gatt-service/nordic_spp_service_server.c"
             # BTstack HID parser (needed by hids_device.c)
             "${BTSTACK_PATH}/src/btstack_hid_parser.c"
+            # GATT *client* in a peripheral build: switch2_ble.c starts the ATT
+            # MTU exchange against our own link, because an ATT server never
+            # initiates it and the Switch 2 console will not pair at MTU 23.
+            "${BTSTACK_PATH}/src/ble/gatt_client.c"
             # BTstack Classic link key DB (needed by btstack_port_esp32.c)
             "${BTSTACK_PATH}/src/classic/btstack_link_key_db_tlv.c"
             # Stub btstack_host_nus_send: cdc_commands.c's FACE.* NUS relay
@@ -557,9 +574,9 @@ if(CONFIG_BOARD STREQUAL "lilygo_tdisplay_s3_amoled")
 endif()
 
 # App-specific definitions
-if(CONFIG_APP STREQUAL "controller_btusb")
+if(CONFIG_APP STREQUAL "universal")
     target_compile_definitions(${COMPONENT_LIB} PUBLIC
-        CONFIG_CONTROLLER_BTUSB=1
+        CONFIG_UNIVERSAL=1
         CONFIG_PAD_INPUT=1
         SENSOR_PAD=1
         BTSTACK_USE_ESP32=1
@@ -568,6 +585,9 @@ if(CONFIG_APP STREQUAL "controller_btusb")
         USBD_DEFAULT_MODE=1
         OLED_I2C_DISPLAY=1
         DISABLE_DISPLAY_SPI=1
+        # Switch 2 BLE output. The console's 5 ms connection interval needs
+        # ESP-IDF >= 6.1 (CONFIG_BT_CTRL_BLE_MIN_CONN_INTERVAL_ENABLE).
+        CONFIG_SWITCH2_BLE_OUTPUT=1
     )
 elseif(CONFIG_APP STREQUAL "usb2usb")
     target_compile_definitions(${COMPONENT_LIB} PUBLIC
@@ -619,14 +639,18 @@ else()
     set(JOYPAD_BCD_DEVICE 256)
 endif()
 
-# Get git commit hash
-execute_process(
-    COMMAND git rev-parse --short HEAD
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE GIT_COMMIT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
+# Get git commit hash — see src/CMakeLists.txt for why the environment wins.
+if(DEFINED ENV{GIT_COMMIT} AND NOT "$ENV{GIT_COMMIT}" STREQUAL "")
+    set(GIT_COMMIT "$ENV{GIT_COMMIT}")
+else()
+    execute_process(
+        COMMAND git rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE GIT_COMMIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
 if(NOT GIT_COMMIT)
     set(GIT_COMMIT "unknown")
 endif()

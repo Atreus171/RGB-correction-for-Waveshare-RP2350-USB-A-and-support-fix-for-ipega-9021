@@ -1,6 +1,7 @@
 # Zephyr app CMakeLists for Joypad on nRF52840 boards
 #
-# Supported boards: xiao_ble (Seeed XIAO), adafruit_feather_nrf52840
+# Supported boards: xiao_ble (Seeed XIAO), adafruit_feather_nrf52840,
+#                   aprbrother_nrf52840, makerdiary_nrf52840 (MDK USB Dongle)
 # Supported apps:   bt2usb (default), usb2usb (with MAX3421E FeatherWing),
 #                   btusb2usb (MAX3421E + Bluetooth combined)
 #
@@ -15,8 +16,8 @@ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 # APP_TYPE selects which app to build (default: bt2usb)
 # Zephyr sysbuild doesn't forward custom -D variables to the inner project,
 # so we detect app type from EXTRA_CONF_FILE (which IS forwarded via sysbuild cache).
-if(DEFINED EXTRA_CONF_FILE AND EXTRA_CONF_FILE MATCHES "prj_controller_btusb")
-    set(APP_TYPE "controller_btusb")
+if(DEFINED EXTRA_CONF_FILE AND EXTRA_CONF_FILE MATCHES "prj_universal")
+    set(APP_TYPE "universal")
 elseif(DEFINED EXTRA_CONF_FILE AND EXTRA_CONF_FILE MATCHES "prj_btusb2usb")
     set(APP_TYPE "btusb2usb")
 elseif(DEFINED EXTRA_CONF_FILE AND EXTRA_CONF_FILE MATCHES "prj_usb2usb")
@@ -80,6 +81,8 @@ set(SRCS
     "${SHARED_SRC}/usb/usbd/modes/psclassic_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/pcemini_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/ps4_mode.c"
+    "${SHARED_SRC}/usb/usbd/modes/dualsense_mode.c"
+    "${SHARED_SRC}/usb/usbd/modes/p5general_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/xid_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/xbone_mode.c"
     "${SHARED_SRC}/usb/usbd/modes/xac_mode.c"
@@ -125,6 +128,62 @@ set(INCLUDE_DIRS
 # App-specific sources and definitions
 # ============================================================================
 
+# ---------------------------------------------------------------------------
+# USB host sources (MAX3421E). Shared by every nRF app that can host: usb2usb,
+# btusb2usb, and universal on the Feather. Kept in ONE list on purpose -- three
+# hand-maintained copies is how a driver ends up compiled into one app and
+# missing from another, which is a link error nobody sees until CI runs the
+# right target.
+# ---------------------------------------------------------------------------
+set(JOYPAD_USB_HOST_SRCS
+    "src/max3421_host_nrf.c"
+    "${SHARED_SRC}/usb/usbh/usbh.c"
+    "${SHARED_SRC}/usb/usbh/intel/intel_wireless_series.c"
+    "${SHARED_SRC}/usb/usbh/hid/hid.c"
+    "${SHARED_SRC}/usb/usbh/hid/hid_registry.c"
+    "${SHARED_SRC}/usb/usbh/hid/hid_utils.c"
+    "${SHARED_SRC}/usb/usbh/xinput/xinput.c"
+    "${SHARED_SRC}/usb/usbh/xbone_auth/xbone_auth.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/generic/hid_gamepad.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/generic/hid_keyboard.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/generic/hid_mouse.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/generic/sinput_host.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_bta.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_m30.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_neo.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_pce.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_sn30.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/dragonrise/dragonrise.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/elo/elo_vagabond.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/google/google_stadia.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/hori/hori_horipad.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/hori/hori_pokken.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/logitech/logitech_wingman.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/microsoft/ms_sidewinder_commander.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/microsoft/ms_sidewinder_dualstrike.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/misc/triple_adapter_v1.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/misc/triple_adapter_v2.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/nintendo/gamecube_adapter.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/nintendo/switch2_pro.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/nintendo/switch_pro.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/raphnet/raphnet_pce.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sega/sega_astrocity.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds3.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds4.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/ds5_auth.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/p5general_host.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds5.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_psc.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/valve/steam_controller_2.c"
+    "${SHARED_SRC}/usb/usbh/hid/devices/vendors/valve/steam_controller.c"
+    "${SHARED_SRC}/lib/tusb_xinput/xinput_host.c"
+    "${TINYUSB_PATH}/src/host/usbh.c"
+    "${TINYUSB_PATH}/src/host/hub.c"
+    "${TINYUSB_PATH}/src/class/hid/hid_host.c"
+    "${TINYUSB_PATH}/src/class/vendor/vendor_host.c"
+    "${TINYUSB_PATH}/src/portable/analog/max3421/hcd_max3421.c"
+)
+
 if(APP_TYPE STREQUAL "usb2usb")
     # -----------------------------------------------------------------------
     # usb2usb: USB Host (MAX3421E) → USB Device (nRF native)
@@ -134,57 +193,7 @@ if(APP_TYPE STREQUAL "usb2usb")
         # --- App ---
         "${SHARED_SRC}/apps/usb2usb/app.c"
 
-        # --- MAX3421E host (nRF Zephyr port) ---
-        "src/max3421_host_nrf.c"
-
-        # --- USB Host layer ---
-        "${SHARED_SRC}/usb/usbh/usbh.c"
-        "${SHARED_SRC}/usb/usbh/hid/hid.c"
-        "${SHARED_SRC}/usb/usbh/hid/hid_registry.c"
-        "${SHARED_SRC}/usb/usbh/hid/hid_utils.c"
-        "${SHARED_SRC}/usb/usbh/xinput/xinput.c"
-        "${SHARED_SRC}/usb/usbh/xbone_auth/xbone_auth.c"
-
-        # --- USB HID device drivers ---
-        "${SHARED_SRC}/usb/usbh/hid/devices/generic/hid_gamepad.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/generic/hid_keyboard.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/generic/hid_mouse.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/generic/sinput_host.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_bta.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_m30.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_neo.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_pce.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/dragonrise/dragonrise.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/elo/elo_vagabond.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/google/google_stadia.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/hori/hori_horipad.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/hori/hori_pokken.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/logitech/logitech_wingman.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/microsoft/ms_sidewinder_commander.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/microsoft/ms_sidewinder_dualstrike.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/misc/triple_adapter_v1.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/misc/triple_adapter_v2.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/nintendo/gamecube_adapter.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/nintendo/switch2_pro.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/nintendo/switch_pro.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/raphnet/raphnet_pce.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sega/sega_astrocity.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds3.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds4.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds5.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_psc.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/valve/steam_controller_2.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/valve/steam_controller.c"
-
-        # --- XInput host driver (tusb_xinput library) ---
-        "${SHARED_SRC}/lib/tusb_xinput/xinput_host.c"
-
-        # --- TinyUSB host stack ---
-        "${TINYUSB_PATH}/src/host/usbh.c"
-        "${TINYUSB_PATH}/src/host/hub.c"
-        "${TINYUSB_PATH}/src/class/hid/hid_host.c"
-        "${TINYUSB_PATH}/src/class/vendor/vendor_host.c"
-        "${TINYUSB_PATH}/src/portable/analog/max3421/hcd_max3421.c"
+        ${JOYPAD_USB_HOST_SRCS}
     )
 
     list(APPEND INCLUDE_DIRS
@@ -213,57 +222,7 @@ elseif(APP_TYPE STREQUAL "btusb2usb")
         # --- App (shared with usb2usb) ---
         "${SHARED_SRC}/apps/usb2usb/app.c"
 
-        # --- MAX3421E host (nRF Zephyr port) ---
-        "src/max3421_host_nrf.c"
-
-        # --- USB Host layer ---
-        "${SHARED_SRC}/usb/usbh/usbh.c"
-        "${SHARED_SRC}/usb/usbh/hid/hid.c"
-        "${SHARED_SRC}/usb/usbh/hid/hid_registry.c"
-        "${SHARED_SRC}/usb/usbh/hid/hid_utils.c"
-        "${SHARED_SRC}/usb/usbh/xinput/xinput.c"
-        "${SHARED_SRC}/usb/usbh/xbone_auth/xbone_auth.c"
-
-        # --- USB HID device drivers ---
-        "${SHARED_SRC}/usb/usbh/hid/devices/generic/hid_gamepad.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/generic/hid_keyboard.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/generic/hid_mouse.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/generic/sinput_host.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_bta.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_m30.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_neo.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/8bitdo/8bitdo_pce.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/dragonrise/dragonrise.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/elo/elo_vagabond.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/google/google_stadia.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/hori/hori_horipad.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/hori/hori_pokken.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/logitech/logitech_wingman.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/microsoft/ms_sidewinder_commander.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/microsoft/ms_sidewinder_dualstrike.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/misc/triple_adapter_v1.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/misc/triple_adapter_v2.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/nintendo/gamecube_adapter.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/nintendo/switch2_pro.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/nintendo/switch_pro.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/raphnet/raphnet_pce.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sega/sega_astrocity.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds3.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds4.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_ds5.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/sony/sony_psc.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/valve/steam_controller_2.c"
-        "${SHARED_SRC}/usb/usbh/hid/devices/vendors/valve/steam_controller.c"
-
-        # --- XInput host driver (tusb_xinput library) ---
-        "${SHARED_SRC}/lib/tusb_xinput/xinput_host.c"
-
-        # --- TinyUSB host stack ---
-        "${TINYUSB_PATH}/src/host/usbh.c"
-        "${TINYUSB_PATH}/src/host/hub.c"
-        "${TINYUSB_PATH}/src/class/hid/hid_host.c"
-        "${TINYUSB_PATH}/src/class/vendor/vendor_host.c"
-        "${TINYUSB_PATH}/src/portable/analog/max3421/hcd_max3421.c"
+        ${JOYPAD_USB_HOST_SRCS}
 
         # --- nRF BTstack TLV ---
         "src/btstack_tlv_nrf.c"
@@ -375,15 +334,15 @@ elseif(APP_TYPE STREQUAL "btusb2usb")
         CFG_TUSB_CONFIG_FILE="tusb_config_nrf.h"
     )
 
-elseif(APP_TYPE STREQUAL "controller_btusb")
+elseif(APP_TYPE STREQUAL "universal")
     # -----------------------------------------------------------------------
-    # controller_btusb: Sensor inputs → BLE Peripheral + USB Device
+    # universal: Sensor inputs → BLE Peripheral + USB Device
     # BTstack BLE peripheral (HOGP), no USB host, no btstack_host/bthid
     # -----------------------------------------------------------------------
     list(APPEND SRCS
         # --- App ---
         "src/stubs_peripheral.c"
-        "${SHARED_SRC}/apps/controller_btusb/app.c"
+        "${SHARED_SRC}/apps/universal/app.c"
 
         # --- Pad input + config ---
         "${SHARED_SRC}/pad/pad_input.c"
@@ -403,6 +362,11 @@ elseif(APP_TYPE STREQUAL "controller_btusb")
         "${SHARED_SRC}/bt/ble_output/ble_output_xbox.c"
         "${SHARED_SRC}/bt/ble_output/ble_nus.c"
         "${SHARED_SRC}/bt/ble_output/ble_xbox_gatt_db.c"
+        # Native Switch 2 controller output (CONFIG_SWITCH2_BLE_OUTPUT below).
+        # Needs Zephyr's open link layer for the console's 5 ms interval —
+        # see boards/makerdiary_nrf52840.overlay.
+        "${SHARED_SRC}/bt/switch2_ble/switch2_proto.c"
+        "${SHARED_SRC}/bt/switch2_ble/switch2_ble.c"
 
         # --- BT transport ---
         "${SHARED_SRC}/bt/transport/bt_transport.c"
@@ -493,7 +457,7 @@ elseif(APP_TYPE STREQUAL "controller_btusb")
     )
 
     list(APPEND INCLUDE_DIRS
-        "${SHARED_SRC}/apps/controller_btusb"
+        "${SHARED_SRC}/apps/universal"
         "${SHARED_SRC}/pad"
         "${SHARED_SRC}/drivers"
         "${SHARED_SRC}/bt"
@@ -510,13 +474,20 @@ elseif(APP_TYPE STREQUAL "controller_btusb")
     )
 
     target_compile_definitions(app PRIVATE
-        CONFIG_CONTROLLER_BTUSB=1
+        CONFIG_UNIVERSAL=1
         CONFIG_USB=1
         CONFIG_PAD_INPUT=1
+        # Native Switch 2 Pro Controller over BLE. Depends on Zephyr's open
+        # link layer accepting the console's 5 ms connection interval —
+        # UNVERIFIED on this radio, see .dev/docs/switch2-ble-output-plan.md.
+        CONFIG_SWITCH2_BLE_OUTPUT=1
+        # Each BLE output mode advertises from its own permanent address, so hosts
+        # treat the modes as separate peers instead of reusing a cached GATT
+        # database across a mode switch (the "forget this device" headache).
+        CONFIG_BLE_PER_MODE_IDENTITY=1
         SENSOR_PAD=1
         WS2812_PIN=16
         WS2812_NUM_PIXELS=1
-        DISABLE_USB_HOST=1
         BTSTACK_USE_NRF=1
         ENABLE_BTSTACK=1
         REQUIRE_BLE_OUTPUT=1
@@ -532,6 +503,93 @@ elseif(APP_TYPE STREQUAL "controller_btusb")
     # only on the Feather. Pad (GPIO) input is always available via SENSOR_PAD.
     if(BOARD MATCHES "adafruit_feather_nrf52840")
         target_compile_definitions(app PRIVATE SENSOR_JOYWING=1)
+    endif()
+
+    # USB host (MAX3421E USB Host FeatherWing) — Feather only, and OPTIONAL at
+    # runtime. The Feather is the one nRF board that can physically take the
+    # wing, so only it compiles the host stack in; every other nRF board keeps
+    # DISABLE_USB_HOST and stays device-only. Within the Feather build the wing
+    # does NOT have to be fitted: usbh_init() reads the MAX3421E REVISION
+    # register and only calls tusb_init()/arms the INT when the chip answers
+    # (src/usb/usbh/usbh.c), and main.c gates its own host paths on
+    # max3421_is_detected(). One UF2 therefore runs on a bare Feather and on a
+    # Feather + host wing.
+    #
+    # This is what lets universal reach the P5General auth dongle, so PS5 output
+    # works here without the dual-MCU UART bridge.
+    if(BOARD MATCHES "adafruit_feather_nrf52840")
+        # MAX_DEVICES: the hid_devices[] array is indexed by USB dev_addr and
+        # costs ~2 KB per slot, so the stock 15 is 30 KB -- which this app, with
+        # BLE central + BLE peripheral + display + pad already resident, cannot
+        # afford (it overflows RAM by 2.2 KB). 7 is the documented floor for this
+        # host config: CFG_TUH_DEVICE_MAX(5) + CFG_TUH_HUB(1) + 1, so hub support
+        # is retained. Frees ~16 KB. Per-app override only -- see core/buttons.h.
+        target_compile_definitions(app PRIVATE CONFIG_MAX3421=1 MAX_DEVICES=7)
+        target_sources(app PRIVATE ${JOYPAD_USB_HOST_SRCS})
+        # Applied here rather than via INCLUDE_DIRS: that list is consumed by
+        # target_include_directories() before this board gate runs.
+        target_include_directories(app PRIVATE
+            "${SHARED_SRC}/usb/usbh"
+            "${SHARED_SRC}/lib/tusb_xinput"
+        )
+    else()
+        target_compile_definitions(app PRIVATE DISABLE_USB_HOST=1)
+    endif()
+
+    # Bench/coexist option: keep BLE advertising and connections alive while a
+    # USB data host owns the device (disables the usb_dom force-disconnect in
+    # ble_output.c). Sysbuild strips custom -D vars, so like APP_TYPE this is
+    # detected from EXTRA_CONF_FILE: include nrf/prj_coexist_bench.conf.
+    if(DEFINED EXTRA_CONF_FILE AND EXTRA_CONF_FILE MATCHES "coexist_bench")
+        target_compile_definitions(app PRIVATE CONFIG_BLE_USB_COEXIST=1)
+        message(STATUS "BLE/USB coexist bench mode ENABLED")
+    endif()
+
+    # Pin the BLE output mode this build boots into (index from ble_output_mode_t,
+    # e.g. 4 = Switch 2). For a bare dongle there is no button to cycle modes, and
+    # macOS does not reliably attach a tty to the CDC interface, which puts
+    # BLE.MODE.SET out of reach -- so the mode has to be chosen at build time.
+    # An explicit selection saved to flash still wins at runtime.
+    # Sysbuild strips custom -D vars, so this comes through the environment:
+    #   BLE_DEFAULT_MODE=4 make universal_makerdiary_nrf52840
+    # Bring-up only: vary the Switch 2 advertising address so the console sees a
+    # new controller (it will not re-attempt an address whose pairing failed).
+    #   SWITCH2_ADDR_SALT=1 make universal_makerdiary_nrf52840
+    # Bring-up: when this build connects to a real Switch 2 pad as a CENTRAL, print
+    # the pad's entire GATT table (services, characteristics, handles) instead of
+    # running the init sequence. Needed because macOS hides GAP/GATT from clients,
+    # so the pad's GAP placement cannot be read any other way.
+    #   SW2_DUMP_GATT=1 BLE_DEFAULT_MODE=2 make universal_makerdiary_nrf52840
+    # Raw ACL/ATT trace for the Switch 2 device side: prints every ATT PDU in both
+    # directions, so "the console sends nothing" can be told from "BTstack rejects
+    # its requests before our handlers see them".
+    #   SWITCH2_ACL_TRACE=1 make universal_makerdiary_nrf52840
+    if(DEFINED ENV{SWITCH2_ACL_TRACE})
+        target_compile_definitions(app PRIVATE CONFIG_SWITCH2_ACL_TRACE=1)
+        message(STATUS "Switch 2 ACL/ATT trace ENABLED")
+    endif()
+
+    if(DEFINED ENV{SW2_DUMP_GATT})
+        target_compile_definitions(app PRIVATE CONFIG_SW2_DUMP_GATT=1)
+        message(STATUS "Switch 2 pad GATT dump ENABLED")
+    endif()
+
+    # Bring-up experiment: advertise from a different OUI to test whether the console
+    # requires a Nintendo prefix. A Pico W cannot change its OUI at all, so this is
+    # how that question gets answered -- on hardware that can.
+    #   SWITCH2_ADDR_OUI=0x28CDC1 make universal_makerdiary_nrf52840
+    if(DEFINED ENV{SWITCH2_ADDR_OUI})
+        target_compile_definitions(app PRIVATE CONFIG_SWITCH2_ADDR_OUI=$ENV{SWITCH2_ADDR_OUI})
+        message(STATUS "Switch 2 address OUI override $ENV{SWITCH2_ADDR_OUI}")
+    endif()
+    if(DEFINED ENV{SWITCH2_ADDR_SALT})
+        target_compile_definitions(app PRIVATE CONFIG_SWITCH2_ADDR_SALT=$ENV{SWITCH2_ADDR_SALT})
+        message(STATUS "Switch 2 address salt $ENV{SWITCH2_ADDR_SALT}")
+    endif()
+
+    if(DEFINED ENV{BLE_DEFAULT_MODE})
+        target_compile_definitions(app PRIVATE CONFIG_BLE_DEFAULT_MODE=$ENV{BLE_DEFAULT_MODE})
+        message(STATUS "BLE default output mode pinned to $ENV{BLE_DEFAULT_MODE}")
     endif()
 
     if(DEFINED JP_RECOVERY_WIPE_ON_BOOT)
@@ -710,10 +768,10 @@ if("${SRCS}" MATCHES "bthid_registry\\.c")
 endif()
 
 # ============================================================================
-# GATT header generation (peripheral mode — controller_btusb)
+# GATT header generation (peripheral mode — universal)
 # ============================================================================
 
-if(APP_TYPE STREQUAL "controller_btusb")
+if(APP_TYPE STREQUAL "universal")
     set(COMPILE_GATT "${BTSTACK_PATH}/tool/compile_gatt.py")
 
     add_custom_command(
@@ -768,13 +826,18 @@ else()
     set(JOYPAD_BCD_DEVICE 256)  # 0x0100 fallback
 endif()
 
-execute_process(
-    COMMAND git rev-parse --short HEAD
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    OUTPUT_VARIABLE GIT_COMMIT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
+# Get git commit hash — see src/CMakeLists.txt for why the environment wins.
+if(DEFINED ENV{GIT_COMMIT} AND NOT "$ENV{GIT_COMMIT}" STREQUAL "")
+    set(GIT_COMMIT "$ENV{GIT_COMMIT}")
+else()
+    execute_process(
+        COMMAND git rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+        OUTPUT_VARIABLE GIT_COMMIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
 if(NOT GIT_COMMIT)
     set(GIT_COMMIT "unknown")
 endif()
@@ -782,7 +845,21 @@ endif()
 string(TIMESTAMP BUILD_TIME "%Y-%m-%d %H:%M:%S")
 
 # Board-specific compile definitions
-if(BOARD MATCHES "adafruit_feather_nrf52840")
+# April Brother and Raytac MDBT50Q-RX are both built as the upstream
+# nrf52840dongle board, so BOARD alone cannot distinguish them. Discriminate on
+# the board overlay path, which IS present in this image's cache
+# (DTC_OVERLAY_FILE) -- unlike a plain -D variable, which under sysbuild lands
+# only in the sysbuild cache and never reaches the application image. Passing
+# -DJOYPAD_BOARD (with or without the nrf_ image prefix) silently left it empty
+# here, and the Raytac RX came up identifying as an April Brother, with that
+# board's LED and button pins.
+if(DTC_OVERLAY_FILE MATCHES "raytac_mdbt50q_cx_40")
+    set(BOARD_DEFINE "BOARD_RAYTAC_MDBT50Q_CX40=1")
+    set(BOARD_NAME_STR "raytac_mdbt50q_cx_40")
+elseif(DTC_OVERLAY_FILE MATCHES "raytac_mdbt50q_rx")
+    set(BOARD_DEFINE "BOARD_RAYTAC_MDBT50Q_RX=1")
+    set(BOARD_NAME_STR "raytac_mdbt50q_rx")
+elseif(BOARD MATCHES "adafruit_feather_nrf52840")
     set(BOARD_DEFINE "BOARD_FEATHER_NRF52840=1")
     set(BOARD_NAME_STR "adafruit_feather_nrf52840")
 elseif(BOARD MATCHES "nrf52840dongle")
@@ -790,9 +867,20 @@ elseif(BOARD MATCHES "nrf52840dongle")
     # board + boards/aprbrother_nrf52840.overlay (see nrf/Makefile alias).
     set(BOARD_DEFINE "BOARD_APRBROTHER_NRF52840=1")
     set(BOARD_NAME_STR "aprbrother_nrf52840")
+elseif(BOARD MATCHES "nrf52840_mdk_usb_dongle")
+    # Makerdiary MDK USB Dongle is built as the upstream nrf52840_mdk_usb_dongle
+    # board + boards/makerdiary_nrf52840.overlay (see nrf/Makefile alias).
+    set(BOARD_DEFINE "BOARD_MAKERDIARY_NRF52840=1")
+    set(BOARD_NAME_STR "makerdiary_nrf52840")
 else()
     set(BOARD_NAME_STR "xiao_ble")
 endif()
+
+# Zephyr's open-source link layer (CONFIG_BT_LL_SW_SPLIT, needed for the
+# Switch 2's sub-spec 5 ms connection interval) puts its controller-side HCI
+# layer in the same image as BTstack, and both define hci_init(). Rename
+# BTstack's copy in the app build; it is the only symbol that collides.
+target_compile_definitions(app PRIVATE hci_init=btstack_hci_init)
 
 target_compile_definitions(app PRIVATE
     JOYPAD_VERSION="${JOYPAD_VERSION}"
@@ -808,6 +896,6 @@ target_compile_options(app PRIVATE -Wno-error)
 
 # Force-include btstack_config.h so all BTstack headers see ENABLE_BLE etc.
 # BTstack headers check #ifdef ENABLE_BLE but don't include btstack_config.h themselves.
-if(APP_TYPE STREQUAL "controller_btusb" OR APP_TYPE STREQUAL "bt2usb" OR APP_TYPE STREQUAL "btusb2usb")
+if(APP_TYPE STREQUAL "universal" OR APP_TYPE STREQUAL "bt2usb" OR APP_TYPE STREQUAL "btusb2usb")
     target_compile_options(app PRIVATE -include btstack_config.h)
 endif()

@@ -28,7 +28,13 @@
 #define SLIP_ESC_ESC  0xDD
 
 #define UART_PEER_TIMEOUT_MS  500
-#define TX_RING_SIZE          512   // power of two
+// 2 KB, not 512 B. In P5General mode this link carries per-report signing
+// traffic (A->B SIGN_REQ, B->A SIGN_RESP at the console's ~250 Hz) alongside
+// input frames, and a full ring drops frames silently -- measured at ~200
+// drops/second, which is what made BLE input choppy with presses missed and
+// releases held. The ring lives in .bss, so this costs RAM, not image size
+// (which matters: B's image has ~2.5 KB of slot headroom).
+#define TX_RING_SIZE          2048  // power of two
 #define RX_FRAME_MAX          128   // > max raw frame (1 + 46 + 4 = 51)
 
 static uart_inst_t* peer_uart = NULL;
@@ -41,6 +47,20 @@ static uint16_t rx_len;
 static bool     rx_in_esc;
 
 static uint32_t last_rx_ms;
+
+// Link loss telemetry + last-event cache for the periodic refresh below. This
+// link is unacknowledged: a frame lost to a CRC mismatch or a full TX ring is
+// simply gone, and input is only sent when it changes. One lost frame therefore
+// left the consumer holding a stale state until the next change -- a dropped
+// press vanished outright, a dropped release stayed pressed. Measured on a PS5
+// in P5General mode, where this link also carries the per-report signing
+// traffic: input arrived choppy, some presses missed, others held.
+static uint32_t rx_crc_drops;
+static uint32_t tx_ring_drops;
+static uart_peer_event_t last_event;
+static bool      last_event_valid;
+static uint32_t  last_event_tx_ms;
+#define EVENT_REFRESH_MS 100   // resend the current state at least this often
 
 // Link RX telemetry (diagnostics): raw bytes seen on the wire vs valid frames
 // decoded. raw>0 & frames==0 => peer is transmitting a different/garbled
@@ -55,6 +75,14 @@ static bool latest_status_new;
 // Consumer-side: latest diagnostic heartbeat from the producer (B telemetry)
 static uart_peer_debug_t latest_debug;
 static bool latest_debug_new;
+
+// Consumer-side: latest extended state (touch + motion), buffered per player.
+// A MSG_EXT arrives just before its matching EVENT; submit_peer_event() merges
+// it into that event and clears the valid flag (so a later touch/motion-free
+// event doesn't inherit stale touch). Slots are player_index & (SLOTS-1).
+#define UART_PEER_EXT_SLOTS 8
+static uart_peer_ext_t latest_ext[UART_PEER_EXT_SLOTS];
+static bool            latest_ext_valid[UART_PEER_EXT_SLOTS];
 
 // Device name learned over the link
 static char peer_device_name[32] = "Joypad Controller";
@@ -74,7 +102,7 @@ static uint32_t crc32(const uint8_t* data, size_t len) {
 
 static inline bool tx_ring_push(uint8_t byte) {
     uint16_t next = (uint16_t)((tx_head + 1) % TX_RING_SIZE);
-    if (next == tx_tail) return false;   // full — drop
+    if (next == tx_tail) { tx_ring_drops++; return false; }   // full — drop
     tx_ring[tx_head] = byte;
     tx_head = next;
     return true;
@@ -108,6 +136,21 @@ static void frame_send(uint8_t type, const void* payload, size_t plen) {
 // RX DISPATCH
 // ============================================================================
 
+// P5General auth-bridge RX hook. Strong definition lives in p5general_link.c
+// (linked alongside via UART_PEER_SOURCES); the weak no-op here keeps uart_peer
+// self-contained for any target that doesn't build the bridge.
+__attribute__((weak)) void p5general_link_on_frame(uint8_t type, const uint8_t* payload,
+                                                   uint16_t plen) {
+    (void)type; (void)payload; (void)plen;
+}
+
+// PS4/DS4 auth-bridge RX hook. Strong definition in ps4_auth_link.c; weak no-op
+// here so uart_peer stays self-contained on targets without the bridge.
+__attribute__((weak)) void ps4_auth_link_on_frame(uint8_t type, const uint8_t* payload,
+                                                  uint16_t plen) {
+    (void)type; (void)payload; (void)plen;
+}
+
 static void submit_peer_event(const uart_peer_event_t* packed) {
     input_event_t event;
     init_input_event(&event);
@@ -124,6 +167,31 @@ static void submit_peer_event(const uart_peer_event_t* packed) {
     event.analog[ANALOG_L2] = packed->analog[4];
     event.analog[ANALOG_R2] = packed->analog[5];
 
+    // Merge any extended state (touch + motion) that arrived just before this
+    // event, then consume it so a later touch/motion-free event stays clean.
+    uint8_t pi = packed->player_index & (UART_PEER_EXT_SLOTS - 1);
+    if (latest_ext_valid[pi]) {
+        const uart_peer_ext_t* x = &latest_ext[pi];
+        if (x->flags & UART_PEER_EXT_FLAG_TOUCH) {
+            event.has_touch = true;
+            for (int f = 0; f < 2; f++) {
+                event.touch[f].x = x->touch_x[f];
+                event.touch[f].y = x->touch_y[f];
+                event.touch[f].active = (x->touch_active >> f) & 1u;
+            }
+        }
+        if (x->flags & UART_PEER_EXT_FLAG_MOTION) {
+            event.has_motion = true;
+            for (int i = 0; i < 3; i++) {
+                event.accel[i] = x->accel[i];
+                event.gyro[i]  = x->gyro[i];
+            }
+            event.gyro_range  = x->gyro_range;
+            event.accel_range = x->accel_range;
+        }
+        latest_ext_valid[pi] = false;
+    }
+
     router_submit_input(&event);
 }
 
@@ -134,7 +202,7 @@ static void dispatch_frame(const uint8_t* frame, uint16_t len) {
                     ((uint32_t)frame[len - 3] << 8) |
                     ((uint32_t)frame[len - 2] << 16) |
                     ((uint32_t)frame[len - 1] << 24);
-    if (crc32(frame, body) != want) return;    // corrupt frame — drop
+    if (crc32(frame, body) != want) { rx_crc_drops++; return; }   // corrupt frame — drop
 
     uint8_t type = frame[0];
     const uint8_t* payload = &frame[1];
@@ -162,12 +230,30 @@ static void dispatch_frame(const uint8_t* frame, uint16_t len) {
             }
             break;
         case UART_PEER_MSG_DEBUG:
-            if (plen == sizeof(uart_peer_debug_t)) {
-                memcpy(&latest_debug, payload, sizeof(latest_debug));
+            // Accept the current 16-byte struct AND the legacy 12-byte one (no
+            // bt_status, magic 0xDB) so a device MCU on either firmware version
+            // is visible. Zero-fill first so the absent bt_status reads as 0.
+            if (plen == sizeof(uart_peer_debug_t) || plen == 12) {
+                memset(&latest_debug, 0, sizeof(latest_debug));
+                memcpy(&latest_debug, payload,
+                       plen < sizeof(latest_debug) ? plen : sizeof(latest_debug));
                 latest_debug_new = true;
             }
             break;
+        case UART_PEER_MSG_EXT:
+            if (plen == sizeof(uart_peer_ext_t)) {
+                uart_peer_ext_t x;
+                memcpy(&x, payload, sizeof(x));
+                uint8_t pi = x.player_index & (UART_PEER_EXT_SLOTS - 1);
+                latest_ext[pi] = x;
+                latest_ext_valid[pi] = true;
+            }
+            break;
         default:
+            // P5General auth-bridge types (0x04-0x09) and any future ones.
+            p5general_link_on_frame(type, payload, plen);
+            // PS4/DS4 auth-bridge types (0x0B-0x0E).
+            ps4_auth_link_on_frame(type, payload, plen);
             break;
     }
 }
@@ -240,6 +326,26 @@ void uart_peer_task(void) {
         uart_putc_raw(peer_uart, tx_ring[tx_tail]);
         tx_tail = (uint16_t)((tx_tail + 1) % TX_RING_SIZE);
     }
+
+    // Periodic state refresh. Nothing acks or retransmits a frame, so without
+    // this a single lost EVENT frame sticks until the next input change. Both
+    // directions of that hurt: a dropped press is never seen, a dropped release
+    // stays held. Resending the current state costs one 12-byte frame per
+    // 100 ms while idle and makes any loss self-correcting. Skipped while the
+    // ring still has traffic queued, so a refresh never competes with real
+    // input or (in P5General mode) with the report-signing frames.
+    if (last_event_valid && tx_tail == tx_head) {
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if ((uint32_t)(now - last_event_tx_ms) >= EVENT_REFRESH_MS) {
+            last_event_tx_ms = now;
+            frame_send(UART_PEER_MSG_EVENT, &last_event, sizeof(last_event));
+        }
+    }
+}
+
+void uart_peer_get_link_stats(uint32_t* crc_drops, uint32_t* ring_drops) {
+    if (crc_drops)  *crc_drops  = rx_crc_drops;
+    if (ring_drops) *ring_drops = tx_ring_drops;
 }
 
 bool uart_peer_is_connected(void) {
@@ -249,6 +355,10 @@ bool uart_peer_is_connected(void) {
 
 uint32_t uart_peer_get_rx_raw_count(void)   { return rx_raw_bytes; }
 uint32_t uart_peer_get_rx_frame_count(void) { return rx_valid_frames; }
+
+void uart_peer_send_frame(uint8_t type, const void* payload, uint16_t plen) {
+    frame_send(type, payload, plen);
+}
 
 // ----- producer -----
 void uart_peer_producer_tap(output_target_t output, uint8_t player_index,
@@ -268,7 +378,36 @@ void uart_peer_producer_tap(output_target_t output, uint8_t player_index,
             event->analog[ANALOG_L2], event->analog[ANALOG_R2],
         },
     };
+    // Touch/motion don't fit the 12-byte event — send them first as MSG_EXT so
+    // the consumer can merge them into the event it's about to submit. Only when
+    // present, so plain controllers add no link traffic.
+    if (event->has_touch || event->has_motion) {
+        uart_peer_ext_t ext = {0};
+        ext.player_index = player_index;
+        if (event->has_touch) {
+            ext.flags |= UART_PEER_EXT_FLAG_TOUCH;
+            for (int f = 0; f < 2; f++) {
+                ext.touch_x[f] = event->touch[f].x;
+                ext.touch_y[f] = event->touch[f].y;
+                if (event->touch[f].active) ext.touch_active |= (uint8_t)(1u << f);
+            }
+        }
+        if (event->has_motion) {
+            ext.flags |= UART_PEER_EXT_FLAG_MOTION;
+            for (int i = 0; i < 3; i++) {
+                ext.accel[i] = event->accel[i];
+                ext.gyro[i]  = event->gyro[i];
+            }
+            ext.gyro_range  = event->gyro_range;
+            ext.accel_range = event->accel_range;
+        }
+        frame_send(UART_PEER_MSG_EXT, &ext, sizeof(ext));
+    }
+
     frame_send(UART_PEER_MSG_EVENT, &packed, sizeof(packed));
+    last_event = packed;
+    last_event_valid = true;
+    last_event_tx_ms = to_ms_since_boot(get_absolute_time());
 }
 
 bool uart_peer_get_status(uart_peer_status_t* out) {

@@ -1,4 +1,4 @@
-// btstack_host_nus_send stub for ESP32 BLE-peripheral builds (controller_btusb).
+// btstack_host_nus_send stub for ESP32 BLE-peripheral builds (universal).
 //
 // The real implementation is in bt/btstack/btstack_host.c, which ESP only
 // compiles in central mode (bt2usb). Peripheral builds still compile the shared
@@ -29,3 +29,16 @@ void btstack_host_ble_drop_all(uint32_t holdoff_ms)
 {
     (void)holdoff_ms;   // central-side bench tool; no-op on peripheral builds
 }
+
+// --- Scan-state accessors (BT.STATUS / BT.SCAN over CDC) ---------------------
+// Same story as above: cdc_commands.c compiles its BT.* handlers whenever
+// ENABLE_BTSTACK is set, but the central's scanner lives in btstack_host.c. A
+// peripheral never scans, so report "not scanning, nothing suppressing it".
+void btstack_host_start_timed_scan(uint32_t timeout_ms)
+{
+    (void)timeout_ms;   // no central scanner on a peripheral build
+}
+
+bool btstack_host_scan_suppressed(void)      { return false; }
+bool btstack_host_scan_hard_suppressed(void) { return false; }
+const char *btstack_host_scan_supp_src(void) { return "none"; }

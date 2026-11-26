@@ -3,7 +3,7 @@
 //
 // Reads a JoypadOS SInput controller over BLE HID (HOGP) and submits its input
 // to the router. This is the BLE counterpart to sinput_host.c (USB). Without it
-// a SInput controller over BLE (e.g. controller_btusb on the XIAO nRF) is only
+// a SInput controller over BLE (e.g. universal on the XIAO nRF) is only
 // seen as an unhandled "Generic BLE Gamepad" — the generic fallback can't parse
 // SInput's custom report ID 1, so it produces no input and looks like a pairing
 // failure. Matches by DIS VID/PID (0x2E8A/0x10C6) or advertised name.
@@ -117,8 +117,10 @@ static void sinput_ble_process_report(bthid_device_t* device, const uint8_t* dat
     ev->analog[ANALOG_R2] = (uint8_t)(((int32_t)rpt.rt * 255) / 32767);
 
     ev->has_motion = sd->has_motion;
-    ev->accel[0] = rpt.accel_x; ev->accel[1] = rpt.accel_y; ev->accel[2] = rpt.accel_z;
-    ev->gyro[0]  = rpt.gyro_x;  ev->gyro[1]  = rpt.gyro_y;  ev->gyro[2]  = rpt.gyro_z;
+    // SInput device frame -> canonical SDL frame: (-rawX, +rawZ, -rawY). Twin of
+    // the USB path in sinput_host.c; matches SDL's SDL_hidapi_sinput.c.
+    ev->accel[0] = imu_negate_s16(rpt.accel_x); ev->accel[1] = rpt.accel_z; ev->accel[2] = imu_negate_s16(rpt.accel_y);
+    ev->gyro[0]  = imu_negate_s16(rpt.gyro_x);  ev->gyro[1]  = rpt.gyro_z;  ev->gyro[2]  = imu_negate_s16(rpt.gyro_y);
     ev->accel_range = 4000;
     ev->gyro_range  = 2000;
 

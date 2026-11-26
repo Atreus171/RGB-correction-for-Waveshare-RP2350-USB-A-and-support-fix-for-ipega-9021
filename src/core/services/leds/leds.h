@@ -18,7 +18,16 @@ void leds_task(void);
 // Set connected device count (used when devices connect before player assignment)
 void leds_set_connected_devices(int count);
 
+// Set whether a pairing rendezvous is in progress (fast blink instead of the
+// normal idle slow blink, while no device is connected). Solid-on for a
+// connected device always takes priority over this.
+void leds_set_pairing(bool active);
+
 // Set override LED color (for USB output mode indication)
+// Advertising/scanning as a wireless device or host: blink rather than go solid,
+// even with input controllers attached. Solid means "connected to a host/console".
+void leds_set_searching(bool searching);
+
 void leds_set_color(uint8_t r, uint8_t g, uint8_t b);
 
 // Trigger profile indicator pattern

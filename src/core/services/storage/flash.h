@@ -29,6 +29,13 @@
 // at 2, so every reboot reverted it AND wiped router_saved with it).
 #define FLASH_DPAD_MODE_MAX 3
 
+// wireless_policy values — which output wins when USB and BLE could both be
+// live (see the field comment in flash_t).
+#define WIRELESS_POLICY_BOTH 0
+#define WIRELESS_POLICY_USB  1
+#define WIRELESS_POLICY_BLE  2
+#define WIRELESS_POLICY_MAX  2
+
 // Button mapping values:
 // 0x00 = passthrough (no remap, keep original button)
 // 0x01-0x1A = remap to JP_BUTTON_* (1-based: 1=B1, ... 18=A2, ... 24=F2, 25=L5, 26=R5)
@@ -146,8 +153,30 @@ typedef struct {
     // directly but skipped by SELECT+Up/Down.
     uint8_t builtin_disabled_mask;
 
-    // Reserved for future global settings (7 bytes)
-    uint8_t reserved[7];
+    // Non-zero once the user has explicitly picked a BLE output mode
+    // (BLE.MODE.SET / web config). Apps that force a default BLE mode
+    // (universal → SInput) honor ble_output_mode when this is set.
+    // Carved from reserved[] — zero on old flashes = never selected.
+    uint8_t ble_mode_saved;
+
+    // Which output wins when USB and BLE could both be live (dual-output apps
+    // like universal). WIRELESS_POLICY_*: 0=both active (default),
+    // 1=USB dominant (BT yields while a USB data host is connected),
+    // 2=BLE dominant (USB input reports suppressed while a BLE host is
+    // connected). Carved from reserved[] — zero on old flashes = both.
+    uint8_t wireless_policy;
+
+    // Disable the BLE *device* (peripheral) output entirely, so a board
+    // configured purely as a receiver is not also a BLE peripheral alongside
+    // its central role. Stored INVERTED (0 = enabled) so it is carved from
+    // reserved[] with no schema bump: old flashes read 0 and keep advertising,
+    // which is the previous behaviour. Mirrors bt_input_enabled, which gates
+    // the central. WIRELESS_POLICY_* is routing-only and never drops a link,
+    // so it cannot express "do not bring the peripheral up at all".
+    uint8_t ble_output_disabled;
+
+    // Reserved for future global settings (4 bytes)
+    uint8_t reserved[4];
 
     // Custom profiles (4 x 56 = 224 bytes)
     custom_profile_t profiles[CUSTOM_PROFILE_MAX_COUNT];
@@ -193,12 +222,14 @@ static inline unsigned flash_sanitize_record(flash_t* s)
 
     FLASH_CLAMP_(wiimote_orient_mode, 2);                     // auto/horiz/vert
     FLASH_CLAMP_(custom_profile_count, CUSTOM_PROFILE_MAX_COUNT);
-    FLASH_CLAMP_(ble_output_mode, 2);                         // BLE_MODE_COUNT - 1
+    FLASH_CLAMP_(ble_output_mode, 7);                         // BLE_MODE_COUNT - 1 (STANDARD/XBOX/SINPUT/SWITCH_BT/SWITCH2/KBM/KBD/MOUSE)
     FLASH_CLAMP_(routing_mode, 2);                            // simple/merge/broadcast
     FLASH_CLAMP_(merge_mode, 2);                              // priority/blend/all
     FLASH_CLAMP_(dpad_mode, FLASH_DPAD_MODE_MAX);             // incl. Lstick<->Rstick
     FLASH_CLAMP_(bt_input_enabled, 1);
+    FLASH_CLAMP_(ble_output_disabled, 1);
     FLASH_CLAMP_(shoulder_swap, 1);
+    FLASH_CLAMP_(wireless_policy, WIRELESS_POLICY_MAX);      // both/USB/BLE
     FLASH_CLAMP_(joybus_data_pin, 28);                        // 0=default, 1-28=GPIO
     FLASH_CLAMP_(wii_sda_pin, 29);                            // stored as GPIO+1
     FLASH_CLAMP_(wii_scl_pin, 29);
@@ -207,7 +238,7 @@ static inline unsigned flash_sanitize_record(flash_t* s)
 
     // Two fields have no in-band invalid value, so they can't be range-checked
     // on their own — but an incoherent record is exactly what turns them on:
-    //   router_saved         gates the router settings gc2usb / controller_btusb
+    //   router_saved         gates the router settings gc2usb / universal
     //                        / bt2wiiext restore at boot (0 on a clean record).
     //   builtin_disabled_mask hides built-in profiles from the SELECT+D-pad
     //                        cycle; its valid range is build-dependent (one bit

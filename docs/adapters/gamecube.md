@@ -14,18 +14,20 @@ Switch between optimized button mappings for different games:
 - **MKWii** - Mario Kart Wii optimized
 - **Fighting** - Fighting game layout
 
-**Switching Profiles:**
-1. Hold **Select** for 2 seconds
-2. Press **D-Pad Up** to cycle forward
-3. Press **D-Pad Down** to cycle backward
-4. Controller rumbles and LED flashes to confirm
-5. Profile saves to flash memory (persists across power cycles)
+**Switching profiles:**
+
+1. Press **SELECT + D-Pad Up** (previous profile) or **SELECT + D-Pad Down** (next) — both buttons
+   together, not one after the other
+2. Keep them held for about **0.7 s**; a quick tap passes straight through to the game
+3. LED flashes and the controller rumbles to confirm
+4. The selection stops at the first and last profile — it does not wrap around
+5. Profile saves to flash (persists across power cycles)
 
 ### Keyboard Mode
 
 Use a USB keyboard as a GameCube keyboard:
 
-- Press **Scroll Lock** or **F14** to toggle keyboard mode
+- Press **Scroll Lock**, **F14**, or **Ctrl+Alt+K** to toggle keyboard mode
 - LED indicator shows when active
 - All standard keys mapped to GameCube keyboard protocol
 - Works with Phantasy Star Online and other keyboard-compatible games
@@ -198,6 +200,7 @@ Pin 6: 3.3V (optional, some boards)
 
 **Keyboard mode not activating:**
 - Press Scroll Lock or F14 key
+- No Scroll Lock and no F13-F24 row (most 65% and TKL boards)? Use **Ctrl+Alt+K** instead
 - Check LED indicator
 - Some keyboards may not be compatible
 

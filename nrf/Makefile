@@ -1,9 +1,11 @@
 # Makefile for Joypad on nRF52840 boards (nRF Connect SDK / Zephyr)
 #
-# Supported boards: xiao_ble, adafruit_feather_nrf52840
+# Supported boards: xiao_ble, adafruit_feather_nrf52840, aprbrother_nrf52840,
+#                   makerdiary_nrf52840, raytac_mdbt50q_rx,
+#                   raytac_mdbt50q_cx_40
 # Supported apps:   bt2usb (default), usb2usb (with MAX3421E FeatherWing),
 #                   btusb2usb (MAX3421E + Bluetooth combined),
-#                   controller_btusb (sensor input + BLE peripheral + USB)
+#                   universal (sensor input + BLE peripheral + USB)
 # Requires: nRF Connect SDK v3.1.0 (installed via 'make init')
 # Usage:
 #   make init              # One-time workspace setup
@@ -24,7 +26,30 @@ APP_TYPE ?= bt2usb
 # dongle is the upstream nrf52840dongle_nrf52840 board + a custom overlay.
 ZEPHYR_BOARD := $(BOARD)
 ifeq ($(BOARD),aprbrother_nrf52840)
-    ZEPHYR_BOARD := nrf52840dongle_nrf52840
+    # Zephyr hw-model-v2 board name (was nrf52840dongle_nrf52840 pre-NCS 3.x)
+    ZEPHYR_BOARD := nrf52840dongle/nrf52840
+endif
+# Makerdiary MDK USB Dongle has a native Zephyr board definition.
+ifeq ($(BOARD),makerdiary_nrf52840)
+    ZEPHYR_BOARD := nrf52840_mdk_usb_dongle
+endif
+# Raytac MDBT50Q-RX is the upstream nrf52840dongle board + its own overlay --
+# the SAME upstream board as the April Brother dongle, so these two can only be
+# told apart by the alias below, never by ZEPHYR_BOARD.
+ifeq ($(BOARD),raytac_mdbt50q_rx)
+    ZEPHYR_BOARD := nrf52840dongle/nrf52840
+    # Explicit, so this Adafruit-bootloader layout applies to THIS board only.
+    # Naming it pm_static_nrf52840dongle_nrf52840.yml would also capture the
+    # April Brother dongle, which shares that Zephyr board.
+    PM_STATIC := $(shell pwd)/pm_static_raytac_mdbt50q_rx.yml
+endif
+# Raytac MDBT50Q-CX-40 has NO upstream Zephyr definition, so it is built from the
+# out-of-tree board in boards/raytac/mdbt50q_cx_40 (hence BOARD_ROOT). Nordic
+# legacy DFU bootloader, so the artifact is a HEX/.zip, not a UF2.
+ifeq ($(BOARD),raytac_mdbt50q_cx_40)
+    ZEPHYR_BOARD := raytac_mdbt50q_cx_40/nrf52840
+    BOARD_ROOT_ARG := -DBOARD_ROOT=$(shell pwd)
+    PM_STATIC := $(shell pwd)/pm_static_raytac_mdbt50q_cx_40.yml
 endif
 
 # Auto-detect NCS toolchain (adds west, cmake, python3, etc. to PATH)
@@ -42,6 +67,21 @@ APP_CONF := $(wildcard $(shell pwd)/prj_$(APP_TYPE).conf)
 
 BUILD_ARGS := west build -b $(ZEPHYR_BOARD) . --pristine=always --
 BUILD_ARGS += -DAPP_TYPE=$(APP_TYPE)
+# west builds against ZEPHYR_BOARD, so CMake never sees our alias. Pass it
+# explicitly: two aliases can map to one Zephyr board (April Brother and Raytac
+# RX both use nrf52840dongle) and the board identity must follow the alias.
+#
+# NOTE: under sysbuild neither -DVAR nor -Dnrf_VAR reaches the application
+# image's CMake -- both only land in the sysbuild cache. nrf/CMakeLists.txt
+# therefore discriminates boards on DTC_OVERLAY_FILE, which IS propagated. This
+# is kept only for the sysbuild layer and for `make` readability.
+BUILD_ARGS += -DJOYPAD_BOARD=$(BOARD)
+ifneq ($(PM_STATIC),)
+    BUILD_ARGS += -DPM_STATIC_YML_FILE=$(PM_STATIC)
+endif
+ifneq ($(BOARD_ROOT_ARG),)
+    BUILD_ARGS += $(BOARD_ROOT_ARG)
+endif
 ifneq ($(OVERLAY),)
     BUILD_ARGS += -DDTC_OVERLAY_FILE="$(OVERLAY)"
 endif
@@ -85,17 +125,17 @@ flash-uf2:
 		echo "Error: No UF2 file found. Run 'make build' first."; \
 		exit 1; \
 	fi; \
-	for DRIVE in XIAO-SENSE NRF52BOOT FTHR840BOOT MDBT50QBOOT UF2BOOT; do \
+	for DRIVE in XIAO-SENSE NRF52BOOT FTHR840BOOT MDBT50QBOOT UF2BOOT MDK-DONGLE; do \
 		if [ -d "/Volumes/$$DRIVE" ]; then \
 			echo "Copying UF2 to /Volumes/$$DRIVE..."; \
-			cp "$$UF2" "/Volumes/$$DRIVE/"; \
+			cp -X "$$UF2" "/Volumes/$$DRIVE/"; \
 			echo "Flash complete! Device will reset automatically."; \
 			exit 0; \
 		fi; \
 	done; \
 	echo "Error: No UF2 bootloader drive found."; \
 	echo "Enter bootloader mode (double-tap reset) and try again."; \
-	echo "Expected drives: XIAO-SENSE, NRF52BOOT, FTHR840BOOT, MDBT50QBOOT, UF2BOOT"; \
+	echo "Expected drives: XIAO-SENSE, NRF52BOOT, FTHR840BOOT, MDBT50QBOOT, UF2BOOT, MDK-DONGLE"; \
 	exit 1
 
 # Flash via J-Link debugger
@@ -134,4 +174,4 @@ help:
 	@echo ""
 	@echo "Variables:"
 	@echo "  BOARD        - Target board (default: xiao_ble)"
-	@echo "  APP_TYPE     - App to build: bt2usb (default), usb2usb, btusb2usb, or controller_btusb"
+	@echo "  APP_TYPE     - App to build: bt2usb (default), usb2usb, btusb2usb, or universal"

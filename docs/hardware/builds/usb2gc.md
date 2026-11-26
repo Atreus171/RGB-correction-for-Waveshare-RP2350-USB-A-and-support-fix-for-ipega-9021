@@ -119,8 +119,8 @@ make flash-usb2gc_rp2040zero
 
 Flash by holding the BOOT button while connecting USB (or double-tap reset on boards that support it) to mount the `RPI-RP2` drive, then drag-and-drop the `.uf2`. Output files:
 
-- `releases/joypad_<commit>_usb2gc_kb2040.uf2`
-- `releases/joypad_<commit>_usb2gc_rp2040zero.uf2`
+- `releases/joypad_os_<commit>_usb2gc_kb2040.uf2`
+- `releases/joypad_os_<commit>_usb2gc_rp2040zero.uf2`
 
 ## Testing
 
@@ -134,5 +134,6 @@ Flash by holding the BOOT button while connecting USB (or double-tap reset on bo
 
 - The RP2040 runs at **130 MHz** (overclocked from 125 MHz) for precise joybus timing
 - All USB inputs are merged to a single GC output (MERGE_BLEND mode)
-- Profile cycling: hold SELECT + D-pad Up/Down for 2 seconds
+- Profile switching: hold SELECT + D-pad Up (previous) / Down (next) together for ~0.7 s;
+  clamps at the ends
 - See [usb2gc app docs](../../apps/usb2gc.md) for profiles, keyboard mode, and feature details

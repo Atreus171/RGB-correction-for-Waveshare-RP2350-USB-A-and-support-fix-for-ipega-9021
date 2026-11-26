@@ -384,6 +384,8 @@ void app_init(void)
 #elif defined(BTSTACK_USE_NRF)
 #ifdef BOARD_FEATHER_NRF52840
     printf("[app:bt2usb] Adafruit Feather nRF52840 Express BLE -> USB HID\n");
+#elif defined(BOARD_MAKERDIARY_NRF52840)
+    printf("[app:bt2usb] Makerdiary nRF52840 MDK USB Dongle BLE -> USB HID\n");
 #else
     printf("[app:bt2usb] Seeed XIAO nRF52840 BLE -> USB HID\n");
 #endif
@@ -488,5 +490,7 @@ void app_task(void)
 
 #ifdef OLED_I2C_DISPLAY
     oled_update_display();
+    // Pump one pending page of the async display flush per iteration.
+    display_task();
 #endif
 }

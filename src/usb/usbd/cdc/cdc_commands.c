@@ -22,11 +22,13 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
 // Optional pad config support (controller apps)
 #ifdef CONFIG_PAD_INPUT
 #include "pad/pad_input.h"
 #include "pad/pad_config_flash.h"
+#include "platform/platform_gpio.h"
 #endif
 
 // Optional BT support
@@ -38,6 +40,9 @@
 // Optional BLE output support
 #if REQUIRE_BLE_OUTPUT
 #include "bt/ble_output/ble_output.h"
+#ifdef CONFIG_SWITCH2_BLE_OUTPUT
+#include "bt/switch2_ble/switch2_ble.h"
+#endif
 #endif
 
 // PS4 auth flash storage (always compiled with USB device sources)
@@ -50,7 +55,7 @@
 // Bluetooth host capability model (mirrors the usb_host present/configurable
 // split used by CAPS.GET). BT is "present" when the stack is compiled in.
 // It is "configurable" only for apps that actually honour the runtime
-// bt_input_enabled flag (controller_btusb, bt2wiiext, which #define
+// bt_input_enabled flag (universal, bt2wiiext, which #define
 // BT_INPUT_CONFIGURABLE). Dedicated BT bridges (bt2usb, bt2gc, bt2nuon, …)
 // always run BT and never read the flag, so their "Enable Bluetooth Host"
 // toggle is always-on / read-only and must report bt_input:true even on a
@@ -66,6 +71,22 @@
 #  define BT_HOST_CONFIGURABLE 0
 #endif
 #define BT_INPUT_ALWAYS_ON (BT_HOST_PRESENT && !BT_HOST_CONFIGURABLE)
+
+// Same split for the BLE *device* (peripheral) output. Present when the
+// peripheral is compiled in; configurable only for apps that honour the runtime
+// ble_output flag (universal, which #defines BLE_OUTPUT_CONFIGURABLE). A
+// peripheral-only build such as usb2ble is present-but-not-configurable, so its
+// toggle is read-only always-on and must report ble_output:true on a fresh flash.
+#if REQUIRE_BLE_OUTPUT
+#  define BLE_DEV_PRESENT 1
+#else
+#  define BLE_DEV_PRESENT 0
+#endif
+#if defined(BLE_OUTPUT_CONFIGURABLE) && BLE_OUTPUT_CONFIGURABLE
+#  define BLE_DEV_CONFIGURABLE 1
+#else
+#  define BLE_DEV_CONFIGURABLE 0
+#endif
 
 // ============================================================================
 // STATE
@@ -283,15 +304,39 @@ static void cmd_info(const char* json)
         snprintf(imu_str, sizeof(imu_str), "false");  // no IMU reporting
     }
 
+    // Dual-RP: the SWD relay writes a B-flash result to WATCHDOG_SCRATCH0/1
+    // (0x40058000 + 0x0c/0x10) before its warm reboot. status 1=bad header
+    // (likely XIP read failure), 2=SWD flash failed, 3=success; SCRATCH1 = image
+    // length (or the bad magic for status 1). Only valid until the next COLD
+    // boot clears it, so read INFO after flashing but BEFORE power-cycling.
+    char bflash_str[80] = "null";
+#ifdef HOST_OVER_LINK
+    {
+        uint32_t s0 = *(volatile uint32_t*)(0x40058000u + 0x0cu);  // result
+        uint32_t s1 = *(volatile uint32_t*)(0x40058000u + 0x10u);  // length
+        uint32_t s2 = *(volatile uint32_t*)(0x40058000u + 0x14u);  // progress
+        int has_res  = (s0 & 0xFFFFFF00u) == 0xB0000000u;
+        int has_prog = (s2 & 0xF0000000u) == 0xC0000000u;
+        if (has_res || has_prog)
+            snprintf(bflash_str, sizeof(bflash_str),
+                     "{\"st\":%lu,\"v\":%lu,\"prog\":\"%08lx\"}",
+                     (unsigned long)(has_res ? (s0 & 0xFFu) : 0),
+                     (unsigned long)s1,
+                     (unsigned long)(has_prog ? s2 : 0));
+    }
+#endif
+
     snprintf(response_buf, sizeof(response_buf),
              "{\"app\":\"%s\",\"version\":\"%s\",\"board\":\"%s\",\"serial\":\"%s\",\"commit\":\"%s\",\"build\":\"%s\""
-             ",\"reset\":\"0x%lx\",\"battery_mv\":%d,\"chg\":%d,\"imu\":%s,\"flashw\":%lu,\"featw\":%lu"
+             ",\"reset\":\"0x%lx\",\"up\":%lu,\"battery_mv\":%d,\"chg\":%d,\"imu\":%s,\"flashw\":%lu,\"featw\":%lu"
+             ",\"bflash\":%s"
              ",\"features\":{\"onboard_led\":%s}}"
              ,
              APP_NAME, JOYPAD_VERSION, BOARD_NAME, serial, GIT_COMMIT, BUILD_TIME,
-             (unsigned long)platform_last_reset_reason(), platform_battery_millivolts(),
+             (unsigned long)platform_last_reset_reason(),
+             (unsigned long)platform_time_ms(), platform_battery_millivolts(),
              platform_battery_charging(), imu_str, (unsigned long)flash_get_write_count(),
-             (unsigned long)sinput_get_feature_count(),
+             (unsigned long)sinput_get_feature_count(), bflash_str,
 #ifdef BTSTACK_USE_CYW43
              "true"
 #elif defined(BOARD_LED_PIN)
@@ -663,12 +708,41 @@ static void cmd_bootsel(const char* json)
     pending_reboot_time = platform_time_ms();
 }
 
+#ifdef APP_CAN_FLASH_B
+#include "flash_b_app.h"
+#include <string.h>
+// FLASH.B — SWD-flash the host MCU (B) from A's running app, using the image
+// combine_uf2.py staged in A's flash. Blocks ~10-20s (USB drops during the
+// flash, then returns). The last progress line is echoed back so the outcome /
+// failure point is visible over CDC even though logs can't stream mid-block.
+static char flashb_last[96];
+static void flashb_log(const char* m) {
+    strncpy(flashb_last, m, sizeof(flashb_last) - 1);
+    flashb_last[sizeof(flashb_last) - 1] = 0;
+    printf("[FLASH.B] %s\n", m);
+}
+static void cmd_flash_b(const char* json)
+{
+    (void)json;
+    flashb_last[0] = 0;
+    int rc = flash_b_app(flashb_log);
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":%s,\"rc\":%d,\"last\":\"%s\"}",
+             rc == 0 ? "true" : "false", rc, flashb_last);
+    send_json(response_buf);
+}
+#endif
+
 // OTA — reboot into over-the-air (BLE) DFU. Works over the BLE NUS too (the NUS
 // tunnels this command protocol), so a USB-less nRF52 board can be updated
 // wirelessly: send OTA, then push the DFU .zip with nRF Connect.
 static void cmd_ota(const char* json)
 {
     (void)json;
+    if (!platform_has_ota()) {
+        send_error("no OTA path on this board");
+        return;
+    }
     send_ok();
     pending_reboot = PENDING_OTA;
     pending_reboot_time = platform_time_ms();
@@ -810,6 +884,177 @@ static void cmd_mode_list(const char* json)
 
 #if REQUIRE_BLE_OUTPUT
 
+// BLE.PAIR — bench tool: send an SM Security Request on the current BLE
+// peripheral link so the connected central initiates pairing. Lets a script
+// exercise the pairing path without a GUI (e.g. macOS pairs just-works
+// silently). Safe threading: over NUS this runs in the BTstack thread.
+static void cmd_ble_pair(const char* json)
+{
+    (void)json;
+    extern void ble_output_request_pairing(void);
+    ble_output_request_pairing();
+    send_ok();
+}
+
+// BT.SCAN — start the BLE central scan. This dongle has no user button, so the
+// button-press path that normally starts scanning is unreachable; needed to walk a
+// real Switch 2 pad's GATT table from here (see sw2_dump_gatt in btstack_host.c).
+static void cmd_bt_scan(const char* json)
+{
+    (void)json;
+#ifdef ENABLE_BTSTACK
+    extern void btstack_host_suppress_scan(bool suppress);
+    extern void btstack_host_start_scan(void);
+    extern void btstack_host_start_timed_scan(uint32_t timeout_ms);
+    extern uint8_t btstack_classic_get_connection_count(void);
+    btstack_host_suppress_scan(false);
+    // Mirror the dongle button. Scanning stops once something is connected
+    // (the radio belongs to the link), so this is the "add another device"
+    // request: time-box it when a controller is already attached, and scan
+    // open-endedly only when there is nothing to protect.
+    int scan_ms = 0;
+    if (btstack_classic_get_connection_count() > 0) {
+        scan_ms = 60000;
+        btstack_host_start_timed_scan((uint32_t)scan_ms);
+    } else {
+        btstack_host_start_scan();
+    }
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"timed_ms\":%d}", scan_ms);
+    send_json(response_buf);
+#else
+    send_json("{\"ok\":false,\"error\":\"no bt host in build\"}");
+#endif
+}
+
+// BT.TRACE — dump the live diagnostic mark ring (nRF: noinit ring in main.c;
+// weak no-op elsewhere). Read-only bench tool.
+__attribute__((weak)) void bt_diag_dump(void) { }
+static void cmd_bt_trace(const char* json)
+{
+    (void)json;
+    bt_diag_dump();
+    send_ok();
+}
+
+// SWITCH2.SYNC — re-enter Switch 2 pairing mode (forget the bonded console and
+// advertise the pairing persona). Same as the user-button click, over serial:
+// the dongle's button is awkward to reach, and pairing usually needs a config
+// host connected anyway.
+static void cmd_switch2_sync(const char* json)
+{
+    (void)json;
+#ifdef CONFIG_SWITCH2_BLE_OUTPUT
+    if (ble_output_get_mode() != BLE_MODE_SWITCH2) {
+        send_json("{\"ok\":false,\"error\":\"not in Switch 2 mode\"}");
+        return;
+    }
+    switch2_ble_request_sync();
+    send_ok();
+#else
+    send_json("{\"ok\":false,\"error\":\"build has no Switch 2 output\"}");
+#endif
+}
+
+// SWITCH2.SCAN — how many scan requests our advertisement has drawn, and the
+// address prefix of the most recent scanner. Tells us whether a host is even
+// looking at us, without the per-packet marks that flood the diagnostic ring.
+static void cmd_switch2_scan(const char* json)
+{
+    (void)json;
+#ifdef CONFIG_SWITCH2_BLE_OUTPUT
+    extern volatile uint32_t joypad_scan_req_count;
+    extern volatile uint32_t joypad_scan_req_last;
+    extern volatile uint32_t joypad_conn_req_count;
+    extern volatile uint32_t joypad_conn_req_last;
+    extern volatile uint32_t joypad_conn_req_why;
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"scan_reqs\":%lu,\"last\":\"%02lx:%02lx:%02lx\","
+             "\"conn_reqs\":%lu,\"conn_last\":\"%02lx:%02lx:%02lx\",\"conn_why\":%lu}",
+             (unsigned long)joypad_scan_req_count,
+             (unsigned long)((joypad_scan_req_last >> 16) & 0xff),
+             (unsigned long)((joypad_scan_req_last >> 8) & 0xff),
+             (unsigned long)(joypad_scan_req_last & 0xff),
+             (unsigned long)joypad_conn_req_count,
+             (unsigned long)((joypad_conn_req_last >> 16) & 0xff),
+             (unsigned long)((joypad_conn_req_last >> 8) & 0xff),
+             (unsigned long)(joypad_conn_req_last & 0xff),
+             (unsigned long)joypad_conn_req_why);
+    // Append what is actually being advertised, so the identity and payload can
+    // be checked without a sniffer.
+    {
+        // A weak extern *variable* resolves to address 0 when undefined, so reading
+        // it on a backend that has no CYW43 transport (nRF, ESP) is a null
+        // dereference, not a benign zero. Take the address and test it instead.
+        extern uint8_t bt_cyw43_addr_claim_status __attribute__((weak));
+        const uint8_t claim_st = (&bt_cyw43_addr_claim_status != NULL)
+                                 ? bt_cyw43_addr_claim_status : 0xFF;
+        uint8_t a[6], mode, adv[31], cl[6];
+        uint8_t n = switch2_ble_get_adv_debug(a, &mode, adv, sizeof(adv));
+        switch2_ble_get_claimed_addr(cl);
+        size_t pos = strlen(response_buf);
+        if (pos > 0 && response_buf[pos - 1] == '}') pos--;   // reopen the object
+        int w = snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                         ",\"addr\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"addr_mode\":%u,"
+                         "\"claimed\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"claim_st\":%u,\"adv\":\"",
+                         a[0], a[1], a[2], a[3], a[4], a[5], mode,
+                         cl[0], cl[1], cl[2], cl[3], cl[4], cl[5],
+                         (unsigned)claim_st);
+        if (w > 0) pos += (size_t)w;
+        for (uint8_t i = 0; i < n && pos + 3 < sizeof(response_buf); i++) {
+            pos += (size_t)snprintf(response_buf + pos, sizeof(response_buf) - pos, "%02x", adv[i]);
+        }
+        uint16_t cc, itvl, dc; uint8_t st, role, dr;
+        switch2_ble_get_link_debug(&cc, &st, &role, &itvl, &dc, &dr);
+        snprintf(response_buf + pos, sizeof(response_buf) - pos,
+                 "\",\"cc\":%u,\"cc_status\":%u,\"cc_role\":%u,\"cc_itvl\":%u,"
+                 "\"disc\":%u,\"disc_reason\":%u}",
+                 cc, st, role, itvl, dc, dr);
+        uint16_t ar, aw, alr, alw; uint8_t pstage, enc;
+        switch2_ble_get_att_debug(&ar, &aw, &alr, &alw, &pstage, &enc);
+        size_t p2 = strlen(response_buf);
+        if (p2 > 0 && response_buf[p2 - 1] == '}') p2--;
+        snprintf(response_buf + p2, sizeof(response_buf) - p2,
+                 ",\"att_r\":%u,\"att_w\":%u,\"att_txn\":%u,\"last_r\":\"0x%04x\",\"last_w\":\"0x%04x\","
+                 "\"pair_stage\":%u,\"enc\":%u}",
+                 ar, aw, switch2_ble_get_att_txn_count(), alr, alw, pstage, enc);
+        uint16_t aev, amtu, dtx; uint8_t ptx, prx;
+        switch2_ble_get_att_events(&aev, &amtu);
+        switch2_ble_get_link_phy(&ptx, &prx, &dtx);
+        size_t p3 = strlen(response_buf);
+        if (p3 > 0 && response_buf[p3 - 1] == '}') p3--;
+        snprintf(response_buf + p3, sizeof(response_buf) - p3,
+                 ",\"att_ev\":%u,\"att_mtu\":%u,\"stall_drops\":%u,"
+                 "\"phy_tx\":%u,\"phy_rx\":%u,\"dle_tx\":%u}",
+                 aev, amtu, switch2_ble_get_stall_drops(), ptx, prx, dtx);
+    }
+    send_json(response_buf);
+#else
+    send_json("{\"ok\":false,\"error\":\"build has no Switch 2 output\"}");
+#endif
+}
+
+// SWITCH2.PID.SET — advertise a different controller product id and hold it
+// there (0x2069 Pro Controller 2, 0x2066/0x2067 Joy-Con 2 R/L, 0x2073 NSO GC).
+// Steady, unlike the rotating sweep this replaces: a console needs the same
+// advertisement on air for many seconds before it acts on it.
+static void cmd_switch2_pid_set(const char* json)
+{
+#ifdef CONFIG_SWITCH2_BLE_OUTPUT
+    int pid;
+    if (!json_get_int(json, "pid", &pid) || pid < 0 || pid > 0xffff) {
+        send_error("missing or out-of-range pid");
+        return;
+    }
+    switch2_ble_set_pid((uint16_t)pid);
+    snprintf(response_buf, sizeof(response_buf), "{\"ok\":true,\"pid\":%d}", pid);
+    send_json(response_buf);
+#else
+    (void)json;
+    send_json("{\"ok\":false,\"error\":\"build has no Switch 2 output\"}");
+#endif
+}
+
 static void cmd_ble_mode_get(const char* json)
 {
     (void)json;
@@ -828,7 +1073,10 @@ static void cmd_ble_mode_set(const char* json)
         return;
     }
 
-    if (mode < 0 || mode >= BLE_MODE_COUNT) {
+    // Reject unknown modes and modes not compiled into this build (e.g. Switch-BT
+    // on a BLE-only radio) — the same gate the list uses, so a stale client can't
+    // select something this firmware can't run.
+    if (!ble_output_mode_available((ble_output_mode_t)mode)) {
         send_error("invalid mode");
         return;
     }
@@ -864,12 +1112,61 @@ static void cmd_ble_mode_list(const char* json)
 
     bool first = true;
     for (int i = 0; i < BLE_MODE_COUNT && pos < (int)sizeof(response_buf) - 50; i++) {
+        // Hide modes this build can't run (e.g. Switch-BT on a BLE-only radio) so
+        // the web config never offers a mode with no implementation behind it.
+        if (!ble_output_mode_available((ble_output_mode_t)i)) continue;
         if (!first) pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, ",");
         first = false;
         pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
                         "{\"id\":%d,\"name\":\"%s\"}", i, ble_output_get_mode_name(i));
     }
     snprintf(response_buf + pos, sizeof(response_buf) - pos, "]}");
+    send_json(response_buf);
+}
+
+// WIRELESS.POLICY.GET/SET — which output wins when USB and BLE could both be
+// live: 0=both (default), 1=USB dominant, 2=BLE dominant. Applies live (the
+// dominance timer and USB tap read it each pass), no reboot.
+static const char* wireless_policy_name(uint8_t p)
+{
+    switch (p) {
+        case WIRELESS_POLICY_USB: return "usb";
+        case WIRELESS_POLICY_BLE: return "ble";
+        default:                  return "both";
+    }
+}
+
+static void cmd_wireless_policy_get(const char* json)
+{
+    (void)json;
+    flash_t* settings = flash_get_settings();
+    uint8_t policy = settings ? settings->wireless_policy : WIRELESS_POLICY_BOTH;
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"policy\":%d,\"name\":\"%s\"}", policy, wireless_policy_name(policy));
+    send_json(response_buf);
+}
+
+static void cmd_wireless_policy_set(const char* json)
+{
+    int policy;
+    if (!json_get_int(json, "policy", &policy)) {
+        send_error("missing policy");
+        return;
+    }
+    if (policy < 0 || policy > WIRELESS_POLICY_MAX) {
+        send_error("invalid policy");
+        return;
+    }
+    flash_t* settings = flash_get_settings();
+    if (!settings) {
+        send_error("no settings");
+        return;
+    }
+    settings->wireless_policy = (uint8_t)policy;
+    flash_save(settings);
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"policy\":%d,\"name\":\"%s\"}",
+             policy, wireless_policy_name((uint8_t)policy));
     send_json(response_buf);
 }
 
@@ -1163,6 +1460,9 @@ static void cmd_input_stream(const char* json)
         stream_ctx = active_ctx;
         // Reset throttle so the first event per device re-sends the name
         stream_throttle_reset();
+        // Surface the Virtual Pad row right away instead of having it pop
+        // into existence on the first Input Test click.
+        router_announce_virtual_pad();
     } else if (stream_ctx == active_ctx) {
         stream_ctx = NULL;
     }
@@ -1741,12 +2041,17 @@ static void cmd_overlay_clear(const char* json)
 // Body: {
 //   "buttons": <uint32 JP_BUTTON_* mask>,        required
 //   "slot":    0..7,                             optional, default 0
-//   "analog":  [LX,LY,RX,RY,L2,R2,RZ],           optional, defaults to neutral
+//   "analog":  [LX,LY,RX,RY,L2,R2,RZ],           optional, 0-255 each
 // }
 //
 // Stateful: each INPUT.INJECT call replaces the synthetic slot's full
 // state (matches how real controllers report). For a tap, the host sends
 // {buttons:N} then {buttons:0} after a few ms.
+//
+// Omitting "analog" leaves whatever was last injected in place, so a host
+// sending only buttons never disturbs the sticks. Send an explicit neutral
+// array ([128,128,128,128,0,0,128]) to centre them, or "analog":false to stop
+// injecting analog at all and hand the axes back to the real controller.
 static void cmd_input_inject(const char* json)
 {
     int buttons_val;
@@ -1758,17 +2063,116 @@ static void cmd_input_inject(const char* json)
     json_get_int(json, "slot", &slot);
     if (slot < 0 || slot > 7) slot = 0;
 
-    (void)slot;  // reserved; today we OR a single global mask into events
+    (void)slot;  // reserved; today we merge a single global state into events
 
-    // Cache the synthetic button state in the router. Each real input event
-    // (PSX poll, USB poll, BT notification) gets `buttons |= s_inject_buttons`
-    // applied at the top of router_submit_input — works regardless of the
-    // app's routing mode (SIMPLE, MERGE, BROADCAST). Pass buttons=0 to release.
+    // Cache the synthetic state in the router. Each real input event (PSX poll,
+    // USB poll, BT notification) gets the buttons OR'd and the analog merged at
+    // the top of router_submit_input — works regardless of the app's routing
+    // mode (SIMPLE, MERGE, BROADCAST). Pass buttons=0 to release. With no
+    // controller attached, router_inject_task carries it instead.
     router_set_inject_buttons((uint32_t)buttons_val);
 
+    bool analog_clear = false;
+    if (json_get_bool(json, "analog", &analog_clear) && !analog_clear) {
+        // "analog":false gives the axes back to the real controller.
+        router_set_inject_analog(NULL);
+    } else {
+        uint8_t analog[ANALOG_COUNT];
+        int count = json_get_int_array(json, "analog", analog, ANALOG_COUNT);
+        if (count > 0) {
+            // A short array is padded with resting values rather than rejected,
+            // so a host that only cares about the sticks can send four.
+            for (int i = count; i < ANALOG_COUNT; i++) {
+                analog[i] = (i == ANALOG_L2 || i == ANALOG_R2) ? 0 : 128;
+            }
+            router_set_inject_analog(analog);
+        }
+    }
+
+    uint8_t current[ANALOG_COUNT];
+    bool has_analog = router_get_inject_analog(current);
     snprintf(response_buf, sizeof(response_buf),
-             "{\"ok\":true,\"buttons\":%u}",
-             (unsigned)buttons_val);
+             "{\"ok\":true,\"buttons\":%u,\"analog\":%s}",
+             (unsigned)buttons_val, has_analog ? "true" : "false");
+    send_json(response_buf);
+}
+
+// MOUSE.INJECT - Submit a synthetic mouse event into the router from the
+// config host. One-shot, like a real mouse report: deltas apply once, button
+// state is whatever this call carries (send buttons:0 to release a click).
+//   { "dx": <int16>, "dy": <int16>, "wheel": <int8>, "buttons": <bitmask> }
+// buttons: bit0=left, bit1=right, bit2=middle (HID order), mapped onto the
+// same JP_BUTTON_B1/B2/B3 encoding real pointer drivers use. Routes to every
+// output with a pointer path (SInput USB mouse interface, BLE composite,
+// mouse-to-analog transforms) exactly as a physical mouse would.
+static void cmd_mouse_inject(const char* json)
+{
+    input_event_t event;
+    memset(&event, 0, sizeof(event));
+    event.dev_addr = ROUTER_INJECT_MOUSE_ADDR;
+    event.instance = 0;
+    event.type = INPUT_TYPE_MOUSE;
+    event.transport = INPUT_TRANSPORT_NATIVE;
+    for (int i = 0; i < ANALOG_COUNT; i++) {
+        event.analog[i] = (i == ANALOG_L2 || i == ANALOG_R2) ? 0 : 128;
+    }
+
+    int v;
+    if (json_get_int(json, "dx", &v)) {
+        if (v > 32767) v = 32767; else if (v < -32767) v = -32767;
+        event.delta_x = (int16_t)v;
+    }
+    if (json_get_int(json, "dy", &v)) {
+        if (v > 32767) v = 32767; else if (v < -32767) v = -32767;
+        event.delta_y = (int16_t)v;
+    }
+    if (json_get_int(json, "wheel", &v)) {
+        if (v > 127) v = 127; else if (v < -127) v = -127;
+        event.delta_wheel = (int8_t)v;
+    }
+    int buttons = 0;
+    json_get_int(json, "buttons", &buttons);
+    if (buttons & 0x01) event.buttons |= JP_BUTTON_B1;  // left
+    if (buttons & 0x02) event.buttons |= JP_BUTTON_B2;  // right
+    if (buttons & 0x04) event.buttons |= JP_BUTTON_B3;  // middle
+
+    router_submit_input(&event);
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"dx\":%d,\"dy\":%d,\"wheel\":%d,\"buttons\":%d}",
+             event.delta_x, event.delta_y, event.delta_wheel, buttons & 7);
+    send_json(response_buf);
+}
+
+// KEY.INJECT - Submit synthetic keyboard state into the router from the
+// config host. Held-state, like a real keyboard report: the keys and modifiers
+// in this call stay pressed until the next call replaces them.
+//   { "mod": <HID modifier mask>, "keys": [<up to 6 HID usage IDs, page 0x07>] }
+// Send {} (or keys:[] with mod:0) to release everything.
+static void cmd_key_inject(const char* json)
+{
+    input_event_t event;
+    memset(&event, 0, sizeof(event));
+    event.dev_addr = ROUTER_INJECT_KB_ADDR;
+    event.instance = 0;
+    event.type = INPUT_TYPE_KEYBOARD;
+    event.transport = INPUT_TRANSPORT_NATIVE;
+    for (int i = 0; i < ANALOG_COUNT; i++) {
+        event.analog[i] = (i == ANALOG_L2 || i == ANALOG_R2) ? 0 : 128;
+    }
+
+    int mod = 0;
+    json_get_int(json, "mod", &mod);
+    event.kb_modifier = (uint8_t)mod;
+
+    uint8_t keys[6] = {0};
+    int count = json_get_int_array(json, "keys", keys, 6);
+    for (int i = 0; i < count; i++) event.kb_keys[i] = keys[i];
+
+    router_submit_input(&event);
+
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"ok\":true,\"mod\":%d,\"keys\":%d}", mod, count > 0 ? count : 0);
     send_json(response_buf);
 }
 
@@ -2089,8 +2493,14 @@ static void cmd_debug_stream(const char* json)
         // Drain any stale data when disabling
         log_tail = log_head;
     } else {
-        // Flush stale data so only fresh logs are streamed
-        log_tail = log_head;
+        // Flush stale data so only fresh logs are streamed — unless the
+        // caller asks to keep the backlog ({"keep":true}), which streams
+        // everything still in the ring (e.g. boot-time logs).
+        bool keep = false;
+        json_get_bool(json, "keep", &keep);
+        if (!keep) {
+            log_tail = log_head;
+        }
     }
 
     snprintf(response_buf, sizeof(response_buf),
@@ -2234,14 +2644,27 @@ static void cmd_ps4auth_set(const char *json)
     decoded_len = b64_decode(val, val_len, auth.sig, sizeof(auth.sig));
     if (decoded_len != 256) { send_error("signature must be 256 bytes"); return; }
 
-    // Save to flash
-    ps4_auth_flash_save(&auth);
+    // Save to flash — read-back verified, so a false here means the sector does
+    // not hold a usable record no matter what the write path reported.
+    if (!ps4_auth_flash_save(&auth)) {
+        printf("[CDC] PS4AUTH.SET: flash write failed\n");
+        send_error("flash write failed — key not stored");
+        return;
+    }
 
 #ifdef ENABLE_PS4_LOCAL_AUTH
-    // Reload local auth module so it takes effect immediately
+    // Reload local auth module so it takes effect immediately. This re-reads the
+    // sector and re-imports N/E/P/Q through mbedTLS, so it is the strongest
+    // available check that the stored key is actually usable — report it rather
+    // than only printing it to a serial console the user cannot reach in PS4
+    // output mode (see #228).
     ps4_local_auth_reload();
-    printf("[CDC] PS4AUTH.SET: saved, local auth=%s\n",
-           ps4_local_auth_is_available() ? "ready" : "failed");
+    if (!ps4_local_auth_is_available()) {
+        printf("[CDC] PS4AUTH.SET: stored, but key failed to load\n");
+        send_error("key stored but failed to load — check N/E/P/Q and signature");
+        return;
+    }
+    printf("[CDC] PS4AUTH.SET: saved, local auth=ready\n");
 #else
     printf("[CDC] PS4AUTH.SET: saved (RSA signing not available in this build)\n");
 #endif
@@ -2284,11 +2707,16 @@ static void cmd_ps4auth_status(const char *json)
 static void cmd_ps4auth_clear(const char *json)
 {
     (void)json;
-    ps4_auth_flash_erase();
+    bool erased = ps4_auth_flash_erase();
 #ifdef ENABLE_PS4_LOCAL_AUTH
     // Reinit local auth (will fail, disabling local auth)
     ps4_local_auth_reload();
 #endif
+    if (!erased) {
+        printf("[CDC] PS4AUTH.CLEAR: erase failed\n");
+        send_error("flash erase failed — key may still be stored");
+        return;
+    }
     printf("[CDC] PS4AUTH.CLEAR: auth data erased\n");
     send_ok();
 }
@@ -2351,6 +2779,7 @@ static void cmd_router_get(const char* json)
     // debounced). router_init() has already restored them from flash on boot.
     dm = router_get_dpad_mode();
     uint8_t ss = router_get_shoulder_swap() ? 1 : 0;
+    uint8_t bleo = BLE_DEV_PRESENT;   // default on when present, matching the app
     const flash_t* s = settings_for_read(&scratch);
     if (s && s->router_saved) {
         if (s->routing_mode <= 2) rm = s->routing_mode;
@@ -2358,12 +2787,16 @@ static void cmd_router_get(const char* json)
 #if !BT_INPUT_ALWAYS_ON
         bti = s->bt_input_enabled;   // always-on bridges ignore the persisted flag
 #endif
+#if BLE_DEV_CONFIGURABLE
+        bleo = (s->ble_output_disabled == 0);   // always-on builds ignore the flag
+#endif
     }
     snprintf(response_buf, sizeof(response_buf),
              "{\"ok\":true,\"routing_mode\":%d,\"merge_mode\":%d,\"dpad_mode\":%d,"
-             "\"shoulder_swap\":%s,\"bt_input\":%s,"
+             "\"shoulder_swap\":%s,\"bt_input\":%s,\"ble_output\":%s,"
              "\"default_routing_mode\":%d,\"default_merge_mode\":%d}",
              rm, mm, dm, ss ? "true" : "false", bti ? "true" : "false",
+             bleo ? "true" : "false",
              (int)ROUTING_MODE, (int)MERGE_MODE);
     send_json(response_buf);
 }
@@ -2429,7 +2862,7 @@ static void cmd_caps_get(const char* json)
 
     // Track which input sources we've listed so we can backfill any source
     // that routes reference but the input-interface registry doesn't expose
-    // (e.g. BLE Central on controller_btusb — it's routed as input but isn't
+    // (e.g. BLE Central on universal — it's routed as input but isn't
     // a polled InputInterface). A CAPS payload whose routes point at a source
     // missing from inputs[] is internally inconsistent and breaks host tools
     // that map routes back to inputs.
@@ -2537,7 +2970,11 @@ static void cmd_caps_get(const char* json)
     //                   Native-USB adapters (usb2pce/usb2gc) are fixed by silicon
     //                   → present but not configurable → read-only page.
     //   dp           — the PIO USB D+ pin, or -1 for native USB / no host.
-#if defined(REQUIRE_USB_HOST) && REQUIRE_USB_HOST
+#if (defined(REQUIRE_USB_HOST) && REQUIRE_USB_HOST) || (defined(HOST_OVER_LINK) && HOST_OVER_LINK)
+    // HOST_OVER_LINK: this MCU hosts nothing itself but proxies a USB host that
+    // lives on the peer MCU (dual-RP remapper) — advertise it so the config UI
+    // shows the USB input page. Presence is real; the controllers arrive via the
+    // inter-MCU link and register as players like any USB device.
     const char* uh_present = "true";
 #else
     const char* uh_present = "false";
@@ -2567,13 +3004,17 @@ static void cmd_caps_get(const char* json)
     // bridges are present-but-not-configurable → read-only always-on page.
     const char* bt_present      = BT_HOST_PRESENT      ? "true" : "false";
     const char* bt_configurable = BT_HOST_CONFIGURABLE ? "true" : "false";
+    const char* bd_present      = BLE_DEV_PRESENT      ? "true" : "false";
+    const char* bd_configurable = BLE_DEV_CONFIGURABLE ? "true" : "false";
     n = snprintf(out, rem,
                  "],\"usb_host\":{\"present\":%s,\"configurable\":%s,\"dp\":%d}"
                  ",\"bt_host\":{\"present\":%s,\"configurable\":%s}"
+                 ",\"bt_device\":{\"present\":%s,\"configurable\":%s}"
                  ",\"native\":{\"in\":%s%s%s,\"in_source_name\":\"%s\""
                  ",\"out\":%s%s%s,\"out_target_name\":\"%s\",\"out_players\":%d}}",
                  uh_present, uh_configurable, uh_dp,
                  bt_present, bt_configurable,
+                 bd_present, bd_configurable,
                  nin  ? "\"" : "null", nin  ? nin  : "", nin  ? "\"" : "", nin_src,
                  nout ? "\"" : "null", nout ? nout : "", nout ? "\"" : "", nout_tgt, nout_players);
     if (n < 0 || n >= rem) goto overflow;
@@ -2602,6 +3043,10 @@ static void cmd_router_set(const char* json)
     if (json_get_int(json, "dpad_mode", &ival)) settings->dpad_mode = (uint8_t)ival;
     bool bval;
     if (json_get_bool(json, "bt_input", &bval)) settings->bt_input_enabled = bval ? 1 : 0;
+#if BLE_DEV_CONFIGURABLE
+    // Stored inverted (0 = enabled) so old flashes keep advertising; see flash.h.
+    if (json_get_bool(json, "ble_output", &bval)) settings->ble_output_disabled = bval ? 0 : 1;
+#endif
     settings->router_saved = 1;
 
     flash_save_force(settings);
@@ -2648,7 +3093,7 @@ static void cmd_output_native_get(const char* json)
         send_json(response_buf);
         return;
     }
-    char body[512];
+    char body[1024];   // room for remoteplay's WiFi AP + console lists
     uint16_t len = out->get_native_config(body, sizeof(body));
     if (len == 0) {
         snprintf(response_buf, sizeof(response_buf), "{\"ok\":true,\"available\":false}");
@@ -2713,7 +3158,52 @@ static void cmd_ble_drop(const char* json)
     json_get_int(json, "ms", &ms);
     if (ms < 1000) ms = 1000;
     btstack_host_ble_drop_all((uint32_t)ms);
+    // btstack_host only tracks central-role links; an emulated controller's own
+    // peripheral link is deliberately ignored by it, so "drop all" used to leave
+    // the console connected and the adapter off air.
+    extern void switch2_ble_drop_link(void) __attribute__((weak));
+    if (switch2_ble_drop_link) switch2_ble_drop_link();
     send_ok();
+}
+
+
+// BT.CTRL — Bluetooth controller identity. HCI/LMP version 8 = BT 4.2, 9 = BT 5.0
+// (where LE 2M PHY was introduced), 10 = 5.1, 11 = 5.2.
+static void cmd_bt_ctrl(const char* json)
+{
+    (void)json;
+    extern uint8_t bt_cyw43_hci_version __attribute__((weak));
+    extern uint8_t bt_cyw43_lmp_version __attribute__((weak));
+    extern uint16_t bt_cyw43_manufacturer __attribute__((weak));
+    unsigned hci_v = (&bt_cyw43_hci_version != NULL) ? bt_cyw43_hci_version : 0;
+    unsigned lmp_v = (&bt_cyw43_lmp_version != NULL) ? bt_cyw43_lmp_version : 0;
+    unsigned manuf = (&bt_cyw43_manufacturer != NULL) ? bt_cyw43_manufacturer : 0;
+    // The address we actually advertise from, which is what a host keys its GATT
+    // cache on. gap_local_bd_addr() is the controller's public address and is NOT
+    // it when we advertise from a random-static one, so ask for the address in use.
+    // macOS hides BD_ADDRs behind per-device UUIDs, so this is the only way to read
+    // it back and confirm per-mode identities are distinct and stable.
+#ifdef ENABLE_BTSTACK
+    extern void gap_le_get_own_address(uint8_t * addr_type, uint8_t * addr);
+#endif
+    extern int  bt_nrf_ident_mode  __attribute__((weak));
+    extern bool bt_nrf_ident_permode __attribute__((weak));
+    const int  ident_mode    = (&bt_nrf_ident_mode != NULL) ? bt_nrf_ident_mode : -2;
+    const bool ident_permode = (&bt_nrf_ident_permode != NULL) ? bt_nrf_ident_permode : false;
+    uint8_t own_type = 0xFF;
+    bd_addr_t own;
+    memset(own, 0, sizeof(own));
+#ifdef ENABLE_BTSTACK
+    gap_le_get_own_address(&own_type, own);
+#endif
+    snprintf(response_buf, sizeof(response_buf),
+             "{\"hci_ver\":%u,\"lmp_ver\":%u,\"manuf\":%u,"
+             "\"own_addr\":\"%02x:%02x:%02x:%02x:%02x:%02x\",\"own_type\":%u,"
+             "\"ident_mode\":%d,\"ident_permode\":%s}",
+             hci_v, lmp_v, manuf,
+             own[0], own[1], own[2], own[3], own[4], own[5], own_type,
+             ident_mode, ident_permode ? "true" : "false");
+    send_json(response_buf);
 }
 
 static void cmd_bt_status(const char* json)
@@ -2747,10 +3237,13 @@ static void cmd_bt_status(const char* json)
     btstack_host_get_crash_info(&crash_pc, &crash_lr);
 #endif
     int pos = snprintf(response_buf, sizeof(response_buf),
-             "{\"enabled\":%s,\"scanning\":%s,\"connections\":%d,\"nus\":%d,\"gattfree\":%d,\"transport\":\"%s\","
+             "{\"enabled\":%s,\"scanning\":%s,\"supp\":%s,\"hsupp\":%s,\"supp_src\":\"%s\",\"connections\":%d,\"nus\":%d,\"gattfree\":%d,\"transport\":\"%s\","
              "\"up_s\":%lu,\"crash_pc\":\"%08lx\",\"crash_lr\":\"%08lx\",\"devices\":[",
              btstack_host_is_initialized() ? "true" : "false",
              btstack_host_is_scanning() ? "true" : "false",
+             btstack_host_scan_suppressed() ? "true" : "false",
+             btstack_host_scan_hard_suppressed() ? "true" : "false",
+             btstack_host_scan_supp_src(),
              btstack_classic_get_connection_count(),
              nus_state, gattfree, transport,
              (unsigned long)(platform_time_ms() / 1000),
@@ -3097,6 +3590,10 @@ static void cmd_rumble_stop(const char* json)
 // Call from main loop to auto-stop rumble after duration and drain log buffer
 void cdc_commands_task(void)
 {
+    // Carries injected input when no controller is attached to overlay it onto.
+    // Rate-limits itself and stands down while real input is arriving.
+    router_inject_task();
+
 #ifdef CONFIG_DS5_COMPANION
     mic_ring_drain();
     voice_notify_drain();
@@ -3563,42 +4060,75 @@ static void cmd_pad_config_reset(const char* json)
     pending_reboot_time = platform_time_ms();
 }
 
+// Append to response_buf, clamping so a truncated write can't push `pos` past
+// the end. snprintf returns the length it *would* have written, so the common
+// `pos += snprintf(buf + pos, sizeof(buf) - pos, ...)` chain makes the next
+// size argument underflow to a huge size_t once the buffer fills. The pin
+// response is ~600 bytes against CDC_MAX_PAYLOAD, so this cannot fire today —
+// but it is now sized by the board's pin count rather than a fixed 30.
+static int pins_append(int pos, const char* fmt, ...)
+{
+    if (pos < 0 || (size_t)pos >= sizeof(response_buf)) return (int)sizeof(response_buf);
+
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(response_buf + pos, sizeof(response_buf) - pos, fmt, ap);
+    va_end(ap);
+
+    if (n < 0) return pos;                       // encoding error, leave pos put
+    pos += n;
+    if ((size_t)pos > sizeof(response_buf)) pos = (int)sizeof(response_buf);
+    return pos;
+}
+
 static void cmd_pad_config_pins(const char* json)
 {
     (void)json;
 
-    // Report available GPIO pins for this board
-    // RP2040 has GPIO 0-29, ADC on channels 0-3 (GPIO 26-29)
+    // Report the pins this board actually has. Every value here used to be
+    // hardcoded to an RP2040 (GPIO 0-29, ADC on 26-29), which is wrong on both
+    // of the other platforms that compile this command: the nRF52840 numbers
+    // P0/P1 as 0-47 and cannot use 0/1 (LFXO crystal), and the ESP32's
+    // numbering space has gaps. The config tool builds its pin menus from this
+    // response, so a hardcoded range there means offering pins that silently
+    // do nothing when written.
     int pos = 0;
-    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
-                    "{\"ok\":true,\"gpio\":[");
+    pos = pins_append(pos, "{\"ok\":true,\"gpio\":[");
 
-    // GPIO 0-29 (all available on RP2040)
-    for (int i = 0; i <= 29; i++) {
-        if (i > 0) pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, ",");
-        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, "%d", i);
+    bool first = true;
+    uint8_t pin_count = platform_gpio_pin_count();
+    for (uint8_t i = 0; i < pin_count; i++) {
+        if (!platform_gpio_pin_usable(i)) continue;
+        pos = pins_append(pos, first ? "%u" : ",%u", (unsigned)i);
+        first = false;
     }
-    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, "]");
+    pos = pins_append(pos, "]");
 
-    // ADC channels
-    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
-                    ",\"adc\":[0,1,2,3]");
+    // ADC channels, plus the GPIO backing each one where the platform numbers
+    // its analog inputs as GPIOs (-1 elsewhere, so the UI drops the hint).
+    pos = pins_append(pos, ",\"adc\":[");
+    uint8_t adc_count = platform_adc_channel_count();
+    for (uint8_t i = 0; i < adc_count; i++) {
+        pos = pins_append(pos, i ? ",%u" : "%u", (unsigned)i);
+    }
+    pos = pins_append(pos, "],\"adc_gpio\":[");
+    for (uint8_t i = 0; i < adc_count; i++) {
+        pos = pins_append(pos, i ? ",%d" : "%d", (int)platform_adc_channel_gpio(i));
+    }
+    pos = pins_append(pos, "]");
 
     // I2C expander pin ranges
-    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
-                    ",\"i2c_exp_0\":[100,115],\"i2c_exp_1\":[200,215]");
+    pos = pins_append(pos, ",\"i2c_exp_0\":[100,115],\"i2c_exp_1\":[200,215]");
 
-    // Button names for UI labels
-    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
-                    ",\"button_names\":[");
+    // Button names for UI labels — the authoritative order, matching the
+    // positional "buttons" array that PAD.CONFIG.SET reads.
+    pos = pins_append(pos, ",\"button_names\":[");
     for (int i = 0; i < PAD_BTN_COUNT; i++) {
-        if (i > 0) pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, ",");
-        pos += snprintf(response_buf + pos, sizeof(response_buf) - pos,
-                        "\"%s\"", pad_button_names[i]);
+        pos = pins_append(pos, i ? ",\"%s\"" : "\"%s\"", pad_button_names[i]);
     }
-    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, "]");
+    pos = pins_append(pos, "]");
 
-    pos += snprintf(response_buf + pos, sizeof(response_buf) - pos, "}");
+    pos = pins_append(pos, "}");
     send_json(response_buf);
 }
 
@@ -3933,6 +4463,9 @@ static const cmd_entry_t commands[] = {
     {"MP.STATS", cmd_mp_stats},
     {"MP.MODE", cmd_mp_mode},
     {"PING", cmd_ping},
+#ifdef APP_CAN_FLASH_B
+    {"FLASH.B", cmd_flash_b},
+#endif
     {"REBOOT", cmd_reboot},
     {"BOOTSEL", cmd_bootsel},
 #ifdef JOYPAD_HAS_ESP_COREDUMP
@@ -3988,6 +4521,8 @@ static const cmd_entry_t commands[] = {
     {"OVERLAY.SET", cmd_overlay_set},
     {"OVERLAY.CLEAR", cmd_overlay_clear},
     {"INPUT.INJECT", cmd_input_inject},
+    {"MOUSE.INJECT", cmd_mouse_inject},
+    {"KEY.INJECT", cmd_key_inject},
     // Legacy CPROFILE.* aliases (deprecated - redirect to unified commands)
     {"CPROFILE.LIST", cmd_cprofile_list},
     {"CPROFILE.GET", cmd_cprofile_get},
@@ -4031,6 +4566,7 @@ static const cmd_entry_t commands[] = {
     {"VOICE.STATE", cmd_voice_state},
 #endif
     {"BT.STATUS", cmd_bt_status},
+    {"BT.CTRL", cmd_bt_ctrl},
     {"BLE.DROP", cmd_ble_drop},
     {"BT.BONDS.CLEAR", cmd_bt_bonds_clear},
     {"BT.FORGET", cmd_bt_forget},
@@ -4039,8 +4575,16 @@ static const cmd_entry_t commands[] = {
 #endif
 #if REQUIRE_BLE_OUTPUT
     {"BLE.MODE.GET", cmd_ble_mode_get},
+    {"SWITCH2.SYNC", cmd_switch2_sync},
+    {"SWITCH2.SCAN", cmd_switch2_scan},
+    {"SWITCH2.PID.SET", cmd_switch2_pid_set},
     {"BLE.MODE.SET", cmd_ble_mode_set},
     {"BLE.MODE.LIST", cmd_ble_mode_list},
+    {"BLE.PAIR", cmd_ble_pair},
+    {"BT.TRACE", cmd_bt_trace},
+    {"BT.SCAN", cmd_bt_scan},
+    {"WIRELESS.POLICY.GET", cmd_wireless_policy_get},
+    {"WIRELESS.POLICY.SET", cmd_wireless_policy_set},
 #endif
 #ifdef CONFIG_PAD_INPUT
     {"PAD.CONFIG.GET", cmd_pad_config_get},

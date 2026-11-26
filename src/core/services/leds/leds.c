@@ -9,6 +9,12 @@
 #include "platform/platform.h"
 
 static int connected_devices = 0;
+static bool pairing_active = false;
+// Wireless "searching" state: advertising and waiting to be paired to as a BLE
+// device, or scanning as a BT host. Forces the blink pattern even when input
+// controllers are connected -- being usable as a controller and being connected to
+// a console are different things, and the LED reports the latter.
+static bool wireless_searching = false;
 
 // ============================================================================
 // PLAIN GPIO LED (fallback when no NeoPixel)
@@ -59,9 +65,10 @@ static void board_led_set(bool on)
 }
 
 // Plain LED status patterns:
-//   Solid on:            Device(s) connected
-//   Slow blink  (500ms): No devices connected (idle)
-//   Profile indicator:   Fast blinks (count = profile_index + 1)
+//   Solid on:              Device(s) connected
+//   Fast blink  (100ms):   Pairing rendezvous in progress
+//   Slow blink  (500ms):   No devices connected, not pairing (idle)
+//   Profile indicator:     Fast blinks (count = profile_index + 1)
 static void board_led_task(int count)
 {
     if (!board_led_inited) return;
@@ -91,6 +98,12 @@ static void board_led_task(int count)
     if (count > 0) {
         // Connected — solid on
         board_led_set(true);
+    } else if (pairing_active) {
+        // Pairing — fast blink
+        if (now - board_led_last_toggle >= 100) {
+            board_led_last_toggle = now;
+            board_led_set(!board_led_state);
+        }
     } else {
         // Idle — slow blink
         if (now - board_led_last_toggle >= 500) {
@@ -118,14 +131,26 @@ void leds_set_connected_devices(int count)
     connected_devices = count;
 }
 
+void leds_set_pairing(bool active)
+{
+    pairing_active = active;
+}
+
 void leds_set_color(uint8_t r, uint8_t g, uint8_t b)
 {
     neopixel_set_override_color(r, g, b);
 }
 
+void leds_set_searching(bool searching)
+{
+    wireless_searching = searching;
+}
+
 void leds_task(void)
 {
     int count = playersCount > connected_devices ? playersCount : connected_devices;
+    // Searching dominates: blink regardless of how many inputs are attached.
+    if (wireless_searching) count = 0;
 #ifdef BOARD_LED_ENABLED
     board_led_task(count);
 #endif

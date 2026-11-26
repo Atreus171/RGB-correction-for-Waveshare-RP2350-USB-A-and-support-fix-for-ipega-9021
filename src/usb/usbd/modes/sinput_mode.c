@@ -406,6 +406,15 @@ static bool sinput_mode_send_report(uint8_t player_index,
 {
     (void)player_index;
 
+    // Typing-only device (real keyboard or KEY.INJECT): keyboard/consumer
+    // report on the keyboard interface, nothing for the gamepad. Without this
+    // branch a pure KEYBOARD event fell through to the gamepad build and its
+    // keys never reached the host.
+    if (event->type == INPUT_TYPE_KEYBOARD) {
+        sinput_send_kbd_consumer(event);
+        return true;
+    }
+
     // Relative pointers (e.g. PlayStation Mouse) go out the SInput composite's
     // mouse interface, not the gamepad report.
     if (event->type == INPUT_TYPE_MOUSE) {
@@ -493,12 +502,15 @@ static bool sinput_mode_send_report(uint8_t player_index,
 
     // IMU data - passthrough from input controller if available
     if (event->has_motion) {
-        sinput_report.accel_x = event->accel[0];
-        sinput_report.accel_y = event->accel[1];
-        sinput_report.accel_z = event->accel[2];
-        sinput_report.gyro_x = event->gyro[0];
-        sinput_report.gyro_y = event->gyro[1];
-        sinput_report.gyro_z = event->gyro[2];
+        // Canonical SDL frame -> SInput device frame: inverse of the input
+        // transform (-x,+z,-y), i.e. native = (-sx, -sz, +sy). Round-trips to
+        // identity for SInput->SInput; makes DS5/DS4->SInput axes correct.
+        sinput_report.accel_x = imu_negate_s16(event->accel[0]);
+        sinput_report.accel_y = imu_negate_s16(event->accel[2]);
+        sinput_report.accel_z = event->accel[1];
+        sinput_report.gyro_x = imu_negate_s16(event->gyro[0]);
+        sinput_report.gyro_y = imu_negate_s16(event->gyro[2]);
+        sinput_report.gyro_z = event->gyro[1];
     } else {
         sinput_report.accel_x = 0;
         sinput_report.accel_y = 0;

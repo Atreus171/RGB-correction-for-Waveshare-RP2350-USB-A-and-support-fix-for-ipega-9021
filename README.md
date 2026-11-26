@@ -86,7 +86,7 @@ make bt2usb_seeed_xiao_nrf52840             # Build
 make flash-bt2usb_seeed_xiao_nrf52840       # Flash
 ```
 
-Output: `releases/joypad_<commit>_<app>_<board>.uf2`
+Output: `releases/joypad_os_<commit>_<app>_<board>.uf2`
 
 **[Full build guide](docs/getting-started/building.md)** — prerequisites, all targets, ESP32/nRF setup, troubleshooting
 
@@ -144,8 +144,8 @@ Wire up GPIO buttons and analog sticks to build your own USB gamepad:
 make controller_fisherprice_v1_kb2040  # Digital buttons → USB HID
 make controller_fisherprice_v2_kb2040  # Buttons + analog stick → USB HID
 make controller_macropad               # Adafruit MacroPad → USB HID
-make controller_btusb_pico_w           # GPIO+JoyWing → BLE+USB HID (Pico W)
-make controller_btusb_rp2040_abb       # GPIO+USB Host → USB HID (ABB Passthrough)
+make universal_pico_w           # GPIO+JoyWing → BLE+USB HID (Pico W)
+make universal_rp2040_abb       # GPIO+USB Host → USB HID (ABB Passthrough)
 ```
 
 ---

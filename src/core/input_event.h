@@ -113,6 +113,34 @@ typedef enum {
     ANALOG_COUNT = 7,   // Number of standard analog axes
 } analog_axis_index_t;
 
+// ============================================================================
+// Field Validity Mask (per-event field ownership)
+// ============================================================================
+// Bitmask of which fields in input_event_t are "owned" by the producer of
+// this event. Lets asymmetric sources (e.g. a single Joy-Con that physically
+// has no right stick) submit events without their non-physical fill values
+// clobbering a partner device's data in MERGE_BLEND/MERGE_ALL.
+//
+// In MERGE_BLEND each blend device's stored event is re-blended into the
+// output, and only fields whose bit is set in valid_fields contribute.
+// In MERGE_ALL a non-zero valid_fields turns the overwrite into a partial
+// update that preserves the other fields from the current output state.
+//
+// 0 (the default) means "all fields valid" and preserves legacy behaviour
+// for full devices (Pro Controller, Xbox, PS, generic HID).
+#define INPUT_VALID_BUTTONS    (1u << 0)
+#define INPUT_VALID_LX         (1u << 1)
+#define INPUT_VALID_LY         (1u << 2)
+#define INPUT_VALID_RX         (1u << 3)
+#define INPUT_VALID_RY         (1u << 4)
+#define INPUT_VALID_L2         (1u << 5)
+#define INPUT_VALID_R2         (1u << 6)
+#define INPUT_VALID_RZ         (1u << 7)
+#define INPUT_VALID_L_STICK    (INPUT_VALID_LX | INPUT_VALID_LY)
+#define INPUT_VALID_R_STICK    (INPUT_VALID_RX | INPUT_VALID_RY)
+#define INPUT_VALID_TRIGGERS   (INPUT_VALID_L2 | INPUT_VALID_R2)
+#define INPUT_VALID_STICKS     (INPUT_VALID_L_STICK | INPUT_VALID_R_STICK)
+
 
 // ============================================================================
 // Unified Input Event Structure
@@ -152,9 +180,17 @@ typedef struct {
                                   // [1] = LY (Left stick Y)
                                   // [2] = RX (Right stick X)
                                   // [3] = RY (Right stick Y)
-                                  // [4] = L2 (Left trigger)
-                                  // [5] = R2 (Right trigger)
-                                  // [6] = RZ (Twist/spinner)
+                                   // [4] = L2 (Left trigger)
+                                   // [5] = R2 (Right trigger)
+                                   // [6] = RZ (Twist/spinner)
+
+    // Per-event field-ownership bitmask (INPUT_VALID_*). 0 = all fields
+    // valid (legacy default for "full" devices). When non-zero, the
+    // router only merges the fields whose bits are set; fields not
+    // owned by the producer are preserved from the current output state.
+    // See INPUT_VALID_* defines above.
+    uint32_t valid_fields;
+
 
     // Relative inputs (mouse, spinner, trackball)
     // delta_x/delta_y are int16 so high-resolution pointers (e.g. Augmental
@@ -192,11 +228,23 @@ typedef struct {
     bool has_rumble;            // Device supports rumble
     bool has_force_feedback;    // Device supports force feedback
 
-    // Motion data (SIXAXIS/DualShock/DualSense)
-    // Accelerometer: raw sensor values, typically ~512 center for DS3, signed for DS4/DS5
-    // Gyroscope: angular velocity, DS3 only has Z axis (X/Y remain 0)
-    int16_t accel[3];           // Accelerometer X, Y, Z
-    int16_t gyro[3];            // Gyroscope X, Y, Z
+    // Motion data (SIXAXIS/DualShock/DualSense/SInput/Steam Controller 2).
+    //
+    // CANONICAL FRAME — SDL's gamepad sensor frame (SDL3 SDL_sensor.h), the core
+    // contract for IMU exactly as sticks/buttons are already normalized:
+    //   +X = right, +Y = up, +Z = toward the user (right-hand rule).
+    //   Accel at rest, controller face-up  -> (0, +1g, 0).
+    //   Gyro axis order: [0]=X=pitch, [1]=Y=yaw, [2]=Z=roll.
+    // Each INPUT driver converts its device-native frame -> SDL ONCE (and sets the
+    // ranges below); the core carries SDL-frame values unmodified through the
+    // router/profiles; each OUTPUT mode converts SDL -> its own device frame, then
+    // scales by range. So a device's frame quirk lives in exactly one place (its
+    // input driver + its output mode) — outputs never sniff the source device.
+    //
+    // SCALE: int16, ±32767 == ±range. gyro_range in dps, accel_range in milli-g.
+    // Use imu_negate_s16() for axis sign flips (plain -v overflows at INT16_MIN).
+    int16_t accel[3];           // Accelerometer X, Y, Z (SDL frame; ±32767 = ±accel_range)
+    int16_t gyro[3];            // Gyroscope X=pitch, Y=yaw, Z=roll (SDL frame; ±32767 = ±gyro_range)
     uint16_t gyro_range;        // Gyro full-scale range in dps (e.g., 100 for DS3, 2000 for DS4/DS5)
     uint16_t accel_range;       // Accel full-scale range in milli-g (e.g., 2000 for DS3, 4000 for DS4/DS5)
     bool has_motion;            // Motion data is valid
@@ -247,12 +295,23 @@ static inline uint16_t touch_norm_to_range(uint16_t c, int32_t max) {
     return (uint16_t)(((int32_t)c * max) / 65535);  // 0..65535 -> 0..max
 }
 
+// Saturating int16 negate for IMU axis sign flips in the SDL frame transforms.
+// Plain -v overflows undefined at INT16_MIN (-32768); clamp it to INT16_MAX.
+static inline int16_t imu_negate_s16(int16_t v) {
+    return v == INT16_MIN ? INT16_MAX : (int16_t)(-v);
+}
+
 // Initialize event with safe defaults
 static inline void init_input_event(input_event_t* event) {
     memset(event, 0, sizeof(input_event_t));
 
     // Buttons are active-high (1 = pressed), so 0x00000000 = all released
     event->buttons = 0x00000000;
+
+    // Legacy default: all fields valid. Drivers that emit partial events
+    // (single Joy-Cons, asymmetric custom controllers) set this to a
+    // narrower mask so the router can preserve the rest.
+    event->valid_fields = 0;
 
     // Set analog axes to appropriate defaults:
     // - Sticks (0-3): centered at 128

@@ -24,9 +24,17 @@
 #include "core/services/players/manager.h"
 #include "core/services/leds/leds.h"
 #include "core/services/storage/storage.h"
-#ifdef CONFIG_CONTROLLER_BTUSB
+#ifdef CONFIG_UNIVERSAL
 #include "imu_nrf.h"
 #include "bt/ble_output/ble_output.h"
+
+#ifdef CONFIG_MAX3421
+// The USB Host FeatherWing is optional on this board: the host stack is always
+// compiled in, and usbh_init() probes for the chip before bringing it up. These
+// gate the host-side paths main() owns so a bare board runs cleanly.
+extern bool max3421_is_detected(void);
+extern void max3421_host_enable_int(void);
+#endif
 #endif
 
 // App layer
@@ -45,20 +53,187 @@ const InputInterface* native_input = NULL;
 
 // ============================================================================
 // FAULT HANDLER — Zephyr's fault dump goes to UART console automatically.
-// We just turn on an LED as visual indicator and halt.
+// We turn on an LED as visual indicator and halt. On boards with no UART
+// wired (USB dongles) the console dump is unreachable, so we also stash the
+// fault PC/LR in __noinit RAM — it survives the next replug's soft boot and
+// main() prints it, so the crash site is readable over CDC after the fact.
 // ============================================================================
+#define FAULT_CRUMB_MAGIC 0xFA17C4B5u
+__noinit static uint32_t fault_crumb_magic;
+__noinit static uint32_t fault_crumb_reason;
+__noinit static uint32_t fault_crumb_pc;
+__noinit static uint32_t fault_crumb_lr;
+
+// RAM copy for this boot: the noinit magic is consumed (cleared) at boot so
+// safe boot applies only to the single boot right after a fault, but the
+// crumb keeps re-printing all uptime — printf only reaches CDC once the log
+// redirect is installed and a client connects.
+static bool     crumb_present = false;
+static uint32_t crumb_reason, crumb_pc, crumb_lr;
+
+// Returns true if the previous boot faulted (call once, at boot).
+static bool fault_crumb_consume(void)
+{
+    if (fault_crumb_magic == FAULT_CRUMB_MAGIC) {
+        crumb_present = true;
+        crumb_reason = fault_crumb_reason;
+        crumb_pc = fault_crumb_pc;
+        crumb_lr = fault_crumb_lr;
+    }
+    fault_crumb_magic = 0;
+    return crumb_present;
+}
+
+// BT stage trace: a tiny noinit event ring written from the BLE peripheral
+// path (ble_output.c calls bt_diag_mark). Survives even a hardware LOCKUP
+// reset that bypasses every software handler, so after a silent reset the
+// boot log shows how far pairing got. Codes are defined at the call sites.
+#define BT_TRACE_MAGIC 0xB7D1A600u
+#define BT_TRACE_N 64
+__noinit static uint32_t bt_trace_magic;
+__noinit static uint32_t bt_trace_ring[BT_TRACE_N];
+__noinit static uint32_t bt_trace_idx;
+
+/* Link-layer CPR interval minimum, in 1.25 ms units, read by the patched
+ * controller (ull_internal.h / ull_conn.c / ull_peripheral.c).
+ *
+ * 6 = the 7.5 ms Bluetooth floor, which is what every mode should run. Switch 2
+ * output lowers it to 4 (5 ms) because the console drives the link that fast;
+ * see switch2_ble_late_init. It MUST stay at the floor otherwise: lowering it
+ * for the whole binary also loosened the central path, and the link layer then
+ * asserted (reason 0xB7, which force-resets the dongle) while connecting to an
+ * ordinary BLE controller. Switch 2 output and the BLE central are never active
+ * together, so the two needs do not collide.
+ */
+unsigned char joypad_le_interval_min = 6;
+
+void bt_diag_mark(uint32_t code)
+{
+    if (bt_trace_magic != BT_TRACE_MAGIC) {
+        for (int i = 0; i < BT_TRACE_N; i++) bt_trace_ring[i] = 0;
+        bt_trace_idx = 0;
+        bt_trace_magic = BT_TRACE_MAGIC;
+    }
+    bt_trace_ring[bt_trace_idx % BT_TRACE_N] = code;
+    bt_trace_idx++;
+    // Live view for app-level milestones (0xC...) and low-rate LE meta events
+    // (0xE03E: connection complete, param/PHY updates). Per-packet marks
+    // (other HCI events, ACL 0xACC0) stay ring-only — printf in the
+    // cooperative BTstack thread is a polled-UART stall.
+    // Subevent 0x02 is LE Advertising Report — one per advertisement seen, so it
+    // is emphatically NOT low-rate while scanning. Printing it floods the CDC log
+    // (burying every useful host/HID line) and, per the note above, stalls the
+    // cooperative BTstack thread on a polled UART for each report — during exactly
+    // the window where connection setup is timing-sensitive. Ring-only.
+    if ((code >> 28) == 0xC ||
+        ((code >> 16) == 0xE03E && (code & 0xFFFF) != 0x0002)) {
+        printf("[btdiag] mark %08x\n", (unsigned)code);
+    }
+}
+
+// Snapshot of the ring from before this boot's reset, for periodic reprint
+// (CDC log clients usually connect well after boot).
+static uint32_t bt_trace_snap[BT_TRACE_N];
+static uint32_t bt_trace_snap_n = 0, bt_trace_snap_total = 0;
+
+static void bt_trace_consume(void)
+{
+    if (bt_trace_magic != BT_TRACE_MAGIC || bt_trace_idx == 0) return;
+    uint32_t n = bt_trace_idx < BT_TRACE_N ? bt_trace_idx : BT_TRACE_N;
+    uint32_t start = bt_trace_idx - n;
+    for (uint32_t i = 0; i < n; i++) {
+        bt_trace_snap[i] = bt_trace_ring[(start + i) % BT_TRACE_N];
+    }
+    bt_trace_snap_n = n;
+    bt_trace_snap_total = bt_trace_idx;
+    // Reset the ring for this boot's marks
+    bt_trace_idx = 0;
+    for (int i = 0; i < BT_TRACE_N; i++) bt_trace_ring[i] = 0;
+}
+
+// On-demand dump of the LIVE ring (this boot's marks) — BT.TRACE command.
+void bt_diag_dump(void)
+{
+    if (bt_trace_magic != BT_TRACE_MAGIC || bt_trace_idx == 0) {
+        printf("[btdiag] live trace: empty\n");
+        return;
+    }
+    uint32_t n = bt_trace_idx < BT_TRACE_N ? bt_trace_idx : BT_TRACE_N;
+    uint32_t start = bt_trace_idx - n;
+    printf("[btdiag] live trace (%u marks, oldest first):",
+           (unsigned)bt_trace_idx);
+    for (uint32_t i = 0; i < n; i++) {
+        printf(" %08x", (unsigned)bt_trace_ring[(start + i) % BT_TRACE_N]);
+    }
+    printf("\n");
+}
+
+static void bt_trace_report(void)
+{
+    if (bt_trace_snap_n == 0) return;
+    printf("[btdiag] trace before reset (%u marks, oldest first):",
+           (unsigned)bt_trace_snap_total);
+    for (uint32_t i = 0; i < bt_trace_snap_n; i++) {
+        printf(" %08x", (unsigned)bt_trace_snap[i]);
+    }
+    printf("\n");
+}
+
+static void fault_crumb_report(void)
+{
+    if (crumb_present) {
+        printf("[fault] PREVIOUS BOOT FAULTED: reason=%u pc=0x%08x lr=0x%08x\n",
+               (unsigned)crumb_reason, (unsigned)crumb_pc, (unsigned)crumb_lr);
+    }
+}
+
+// Newlib assert() → abort() → k_panic loses the assert location (its message
+// goes to the unwired UART). Capture file+line in the crumb and reboot:
+// reason=0xA5, pc=line, lr=first 4 chars of the file's basename.
+void __assert_func(const char *file, int line, const char *func,
+                   const char *expr)
+{
+    (void)func; (void)expr;
+    fault_crumb_magic = FAULT_CRUMB_MAGIC;
+    fault_crumb_reason = 0xA5;
+    fault_crumb_pc = (uint32_t)line;
+    fault_crumb_lr = 0;
+    if (file) {
+        const char *base = file;
+        for (const char *p = file; *p; p++) {
+            if (*p == '/') base = p + 1;
+        }
+        for (int i = 0; i < 4 && base[i]; i++) {
+            fault_crumb_lr |= ((uint32_t)(uint8_t)base[i]) << (8 * i);
+        }
+    }
+    NVIC_SystemReset();
+    for (;;) { }
+}
+
 void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf)
 {
-    (void)reason; (void)esf;
+    fault_crumb_magic = FAULT_CRUMB_MAGIC;
+    fault_crumb_reason = reason;
+    fault_crumb_pc = esf ? esf->basic.pc : 0;
+    fault_crumb_lr = esf ? esf->basic.lr : 0;
 #ifdef BOARD_FEATHER_NRF52840
     // Blue LED on Feather = P1.10, active high
     NRF_P1->DIRSET = (1U << 10);
     NRF_P1->OUTSET = (1U << 10);  // LED on (active high)
+#elif defined(BOARD_MAKERDIARY_NRF52840)
+    // Blue LED on MDK dongle = P0.24, active low
+    NRF_P0->DIRSET = (1U << 24);
+    NRF_P0->OUTCLR = (1U << 24);  // LED on (active low)
 #else
     // Blue LED on XIAO BLE = P0.06, active low
     NRF_P0->DIRSET = (1U << 6);
     NRF_P0->OUTCLR = (1U << 6);   // LED on (active low)
 #endif
+    // Hold the LED visibly, then reboot so the crumb gets printed (halting
+    // forever just strands the dongle until a replug).
+    for (volatile uint32_t i = 0; i < 16000000; i++) { __NOP(); }
+    NVIC_SystemReset();
     for (;;) { __WFI(); }
 }
 
@@ -68,7 +243,21 @@ void k_sys_fatal_error_handler(unsigned int reason, const struct arch_esf *esf)
 
 void bt_ctlr_assert_handle(char *file, uint32_t line)
 {
-    printf("[BT] Controller assert: %s:%u\n", file, (unsigned)line);
+    // SDC asserts can fire from radio ISR context; printf-and-return leaves
+    // the controller in an undefined state (observed as a hard lockup, USB
+    // gone). Record it in the fault crumb (reason 0xB7 tag; pc=line, lr=first
+    // 4 chars of the file name) and reboot — next boot is a safe boot that
+    // reports it over CDC.
+    fault_crumb_magic = FAULT_CRUMB_MAGIC;
+    fault_crumb_reason = 0xB7;
+    fault_crumb_pc = line;
+    fault_crumb_lr = 0;
+    if (file) {
+        for (int i = 0; i < 4 && file[i]; i++) {
+            fault_crumb_lr |= ((uint32_t)(uint8_t)file[i]) << (8 * i);
+        }
+    }
+    NVIC_SystemReset();
 }
 
 // ============================================================================
@@ -154,7 +343,7 @@ static void usb_power_init(void)
            !!(NRF_USBD->USBPULLUP));
 }
 
-#if defined(CONFIG_CONTROLLER_BTUSB) && defined(CONFIG_BOARD_XIAO_BLE)
+#if defined(CONFIG_UNIVERSAL) && defined(CONFIG_BOARD_XIAO_BLE)
 // ============================================================================
 // BATTERY PROTECTION + IDLE DEEP-SLEEP
 // ============================================================================
@@ -208,7 +397,7 @@ static void power_task(void)
         platform_deep_sleep(PWR_WAKE_GPIO, PWR_WAKE_ACTIVE_HIGH);
     }
 }
-#endif  // CONFIG_CONTROLLER_BTUSB && CONFIG_BOARD_XIAO_BLE
+#endif  // CONFIG_UNIVERSAL && CONFIG_BOARD_XIAO_BLE
 
 // ============================================================================
 // MAIN
@@ -216,21 +405,36 @@ static void power_task(void)
 
 int main(void)
 {
-#if defined(CONFIG_CONTROLLER_BTUSB)
-    printf("[joypad] Starting controller_btusb on Adafruit Feather nRF52840...\n");
+#if defined(CONFIG_UNIVERSAL)
+    printf("[joypad] Starting universal on Adafruit Feather nRF52840...\n");
 #elif defined(CONFIG_BTUSB2USB)
     printf("[joypad] Starting btusb2usb on Adafruit Feather nRF52840...\n");
 #elif defined(CONFIG_USB2USB)
     printf("[joypad] Starting usb2usb on Adafruit Feather nRF52840...\n");
 #elif defined(BOARD_FEATHER_NRF52840)
     printf("[joypad] Starting bt2usb on Adafruit Feather nRF52840...\n");
+#elif defined(BOARD_MAKERDIARY_NRF52840)
+    printf("[joypad] Starting bt2usb on Makerdiary nRF52840 MDK USB Dongle...\n");
 #else
     printf("[joypad] Starting bt2usb on Seeed XIAO nRF52840...\n");
 #endif
 
+    // Safe boot: the previous boot hard-faulted. If the fault is in early
+    // init (storage/NVS, BT bring-up) a normal boot crash-loops before USB
+    // ever enumerates and the crumb is unreadable. Skip storage/BT init on
+    // the single boot after a fault so USB comes up and the crumb reaches
+    // the CDC log; the boot after that is normal again.
+    bool safe_boot = fault_crumb_consume();
+    fault_crumb_report();
+    bt_trace_consume();
+    bt_trace_report();
+    if (safe_boot) {
+        printf("[joypad] SAFE BOOT after fault — skipping storage/BT init\n");
+    }
+
     // Initialize shared services
     leds_init();
-    storage_init();
+    if (!safe_boot) storage_init();
     players_init();
     app_init();
 
@@ -244,9 +448,10 @@ int main(void)
     }
 #endif
 
-    // Get and initialize input interfaces
+    // Get and initialize input interfaces (skipped in safe boot: BT init
+    // reads the same NVS the crash may involve)
     inputs = app_get_input_interfaces(&input_count);
-    for (uint8_t i = 0; i < input_count; i++) {
+    for (uint8_t i = 0; i < input_count && !safe_boot; i++) {
         if (inputs[i] && inputs[i]->init) {
             printf("[joypad] Initializing input: %s\n", inputs[i]->name);
             inputs[i]->init();
@@ -274,14 +479,17 @@ int main(void)
     usb_power_init();
 
 #ifdef CONFIG_MAX3421
-    // Enable MAX3421E interrupt now that TinyUSB host is initialized
+    // Enable MAX3421E interrupt now that TinyUSB host is initialized.
+    // Skipped when the chip is absent: the host stack is compiled in whether or
+    // not the FeatherWing is fitted, and usbh_init() already runs the full
+    // probe-then-init-then-arm sequence when it is. Arming here regardless
+    // would point an IRQ at a host that was never initialized.
     {
-        extern void max3421_host_enable_int(void);
-        max3421_host_enable_int();
+        if (max3421_is_detected()) max3421_host_enable_int();
     }
 #endif
 
-#ifdef CONFIG_CONTROLLER_BTUSB
+#ifdef CONFIG_UNIVERSAL
     // Onboard IMU (XIAO Sense LSM6DS3TR-C) — after USB is up, so a wedged I2C
     // bus can never block enumeration. No-op if the board has no IMU.
     imu_init();
@@ -299,8 +507,11 @@ int main(void)
         tud_task_ext(0, false);
 
 #ifdef CONFIG_MAX3421
-        // Process TinyUSB host events (MAX3421E ISR handles SPI directly)
-        tuh_task_ext(0, false);
+        // Process TinyUSB host events (MAX3421E ISR handles SPI directly).
+        // No chip means no host was ever initialized, so there is nothing to
+        // pump -- and on this board that is a supported configuration, not a
+        // fault (the USB Host FeatherWing is optional).
+        if (max3421_is_detected()) tuh_task_ext(0, false);
 
         // Periodic diagnostic (every 5s for first 60s)
         {
@@ -333,13 +544,25 @@ int main(void)
 
         app_task();
 
-#ifdef CONFIG_CONTROLLER_BTUSB
+#ifdef CONFIG_UNIVERSAL
         imu_task();  // sample onboard IMU → router (throttled to ~100 Hz)
 #endif
 
-#if defined(CONFIG_CONTROLLER_BTUSB) && defined(CONFIG_BOARD_XIAO_BLE)
+#if defined(CONFIG_UNIVERSAL) && defined(CONFIG_BOARD_XIAO_BLE)
         power_task();  // low-battery cutoff + idle deep-sleep (protects the cell)
 #endif
+
+        // Diagnostic: re-announce a stashed fault crumb every 5s so it reaches
+        // a CDC log client no matter when it connects.
+        {
+            static uint32_t crumb_last_ms = 0;
+            uint32_t crumb_now = platform_time_ms();
+            if ((uint32_t)(crumb_now - crumb_last_ms) >= 5000u) {
+                crumb_last_ms = crumb_now;
+                fault_crumb_report();
+                bt_trace_report();
+            }
+        }
 
         // Yield to other Zephyr threads (BTstack runs in its own thread)
         k_msleep(1);

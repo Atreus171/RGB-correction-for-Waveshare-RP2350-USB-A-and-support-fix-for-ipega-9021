@@ -6,6 +6,16 @@
 // HID Host for Classic BT HID devices.
 
 #include "btstack_host.h"
+#ifdef CONFIG_BT_CLASSIC_OUTPUT
+#include "ble_output/ble_output.h"   // ble_output_get_mode() / BLE_MODE_SWITCH_BT
+#include "switch_bt/switch_bt.h"     // switch_bt_apply_gap_identity()
+// True when this build is acting as a Switch Pro Controller (HID device role). In
+// that mode the BT-HID *host* logic must stand down on incoming connections — the
+// Switch is connecting to OUR device role, not us hosting a controller.
+static inline bool bh_switch_bt_mode(void) { return ble_output_get_mode() == BLE_MODE_SWITCH_BT; }
+#else
+static inline bool bh_switch_bt_mode(void) { return false; }
+#endif
 
 #ifdef BTSTACK_DEFER_SCAN
 static bool btstack_host_scan_enabled = false;
@@ -142,6 +152,20 @@ static void switch2_handle_feedback(void);
 #define SCAN_WINDOW   0x0050  // 50ms (default)
 #endif
 
+// Scanning at a 50% duty cycle (50 ms window every 100 ms) takes the radio off a
+// live connection half the time, so input arrives in bursts -- seen as analog
+// input going choppy, then smooth, then choppy again as scanning stops and
+// restarts. That was harmless while scanning was a 60 s window at boot; it is not
+// once a receiver scans continuously. Once a controller is connected, drop to a
+// low duty cycle: discovery still works, just slower.
+//
+// NOT inside the #ifndef above: these are used unconditionally by
+// btstack_host_start_scan(), so letting an app that defines its own SCAN_WINDOW
+// skip them is a build break for that app (bt2nuon_pico_w, which sets both).
+static bool scan_params_busy;      // duty cycle the active scan was started with
+#define SCAN_INTERVAL_BUSY 0x0200  // 320 ms
+#define SCAN_WINDOW_BUSY   0x0018  // 15 ms  (~4.7% duty vs 50%)
+
 // ============================================================================
 // STATE
 // ============================================================================
@@ -193,6 +217,11 @@ typedef struct {
 
 // BLE conn_index offset (BLE devices use conn_index >= this value)
 #define BLE_CONN_INDEX_OFFSET MAX_CLASSIC_CONNECTIONS
+
+// How long a BLE link may sit connected without reaching HID-ready before it is
+// dropped and retried. Generous: bonded reconnects on a busy radio legitimately
+// take seconds to finish discovery, subscribe and (for some pads) read DIS.
+#define BLE_HID_READY_TIMEOUT_MS 15000
 
 typedef enum {
     GATT_IDLE,
@@ -277,6 +306,12 @@ static void switch2_cleanup_on_disconnect(void);
 
 #define MAX_CLASSIC_CONNECTIONS 4
 #define INQUIRY_DURATION 5  // Inquiry duration in 1.28s units
+// Number of active Classic links. Distinct from
+// btstack_classic_get_connection_count(), which deliberately sums Classic AND
+// BLE for LED/status purposes; decisions about Classic scanning must not be
+// influenced by an unrelated BLE peer.
+static uint8_t classic_link_count(void);
+
 #define CLASSIC_CONNECT_TIMEOUT_MS 15000  // Max time to establish HID connection
 
 typedef struct {
@@ -550,6 +585,83 @@ static void hid_host_packet_handler(uint8_t packet_type, uint16_t channel, uint8
 static ble_connection_t* find_connection_by_handle(hci_con_handle_t handle);
 static ble_connection_t* find_connection_by_hids_cid(uint16_t hids_cid);
 static ble_connection_t* find_free_connection(void);
+// ============================================================================
+// Switch 2 pad GATT dump (bring-up tool)
+// ----------------------------------------------------------------------------
+// The device-side emulation in src/bt/switch2_ble must present the SAME attribute
+// table as a real Pro Controller 2 or the console discovers it and silently stops.
+// A macOS GATT client can read the pad's vendor services, but CoreBluetooth hides
+// GAP and GATT (0x1800/0x1801) -- so the pad's GAP contents and handle placement
+// could not be compared. BTstack hides nothing, so walk the pad from here and
+// print every service and characteristic with its handles.
+// ============================================================================
+
+static hci_con_handle_t sw2_dump_handle;
+static gatt_client_service_t sw2_dump_services[12];
+static uint8_t sw2_dump_count, sw2_dump_idx;
+static bool sw2_dump_active;
+
+static void sw2_dump_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size);
+
+static void sw2_dump_next_service(void)
+{
+    if (sw2_dump_idx >= sw2_dump_count) {
+        printf("[SW2_DUMP] ---- end of table (%u services) ----\n", sw2_dump_count);
+        sw2_dump_active = false;
+        return;
+    }
+    gatt_client_service_t *svc = &sw2_dump_services[sw2_dump_idx];
+    printf("[SW2_DUMP] SERVICE 0x%04X-0x%04X uuid16=0x%04X uuid128=", 
+           svc->start_group_handle, svc->end_group_handle, svc->uuid16);
+    for (int i = 0; i < 16; i++) printf("%02x", svc->uuid128[i]);
+    printf("\n");
+    gatt_client_discover_characteristics_for_service(sw2_dump_handler, sw2_dump_handle, svc);
+}
+
+static void sw2_dump_handler(uint8_t packet_type, uint16_t channel, uint8_t *packet, uint16_t size)
+{
+    UNUSED(channel); UNUSED(size);
+    if (packet_type != HCI_EVENT_PACKET) return;
+    switch (hci_event_packet_get_type(packet)) {
+    case GATT_EVENT_SERVICE_QUERY_RESULT:
+        if (sw2_dump_count < (uint8_t)(sizeof(sw2_dump_services) / sizeof(sw2_dump_services[0]))) {
+            gatt_event_service_query_result_get_service(packet, &sw2_dump_services[sw2_dump_count++]);
+        }
+        break;
+    case GATT_EVENT_CHARACTERISTIC_QUERY_RESULT: {
+        gatt_client_characteristic_t ch;
+        gatt_event_characteristic_query_result_get_characteristic(packet, &ch);
+        printf("[SW2_DUMP]   CHR decl=0x%04X val=0x%04X end=0x%04X props=0x%02X uuid16=0x%04X uuid128=",
+               ch.start_handle, ch.value_handle, ch.end_handle, ch.properties, ch.uuid16);
+        for (int i = 0; i < 16; i++) printf("%02x", ch.uuid128[i]);
+        printf("\n");
+        break;
+    }
+    case GATT_EVENT_QUERY_COMPLETE:
+        if (!sw2_dump_active) break;
+        if (sw2_dump_idx == 0xFF) {          // services query just finished
+            sw2_dump_idx = 0;
+            sw2_dump_next_service();
+        } else {
+            sw2_dump_idx++;
+            sw2_dump_next_service();
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+void sw2_dump_gatt(hci_con_handle_t con_handle)
+{
+    sw2_dump_handle = con_handle;
+    sw2_dump_count = 0;
+    sw2_dump_idx = 0xFF;                      // marker: discovering services
+    sw2_dump_active = true;
+    printf("[SW2_DUMP] ---- walking the pad's whole GATT table ----\n");
+    gatt_client_discover_primary_services(sw2_dump_handler, con_handle);
+}
+
 static void start_hids_client(ble_connection_t *conn);
 static void register_ble_hid_listener(hci_con_handle_t con_handle);
 static void register_switch2_hid_listener(hci_con_handle_t con_handle);
@@ -637,7 +749,7 @@ static int host_att_write_callback(hci_con_handle_t con_handle, uint16_t att_han
 }
 
 // Defined (strong) by ble_output.c when the BLE-peripheral path owns the ATT
-// server with its full GATT profile (e.g. controller_btusb, usb2ble). In that
+// server with its full GATT profile (e.g. universal, usb2ble). In that
 // case we must NOT init a second, minimal server -- it would clobber the rich
 // profile. Central-only builds (bt2usb, mouthpad) don't link ble_output, so the
 // weak default applies and we install the minimal server.
@@ -676,7 +788,22 @@ static void setup_hid_handlers(void)
     // of 23 caps that at 20, so a 64-byte SInput report (JoypadOS controllers)
     // would never be delivered — the device connects but sends zero input.
     // 247 covers the full report with margin (fits HCI_ACL_PAYLOAD_SIZE).
-    l2cap_set_max_le_mtu(247);
+    //
+    // Raise the ATT MTU, but never past what a single outgoing ACL buffer can carry.
+    // This is PROCESS-WIDE and so also caps us as a *peripheral*: ATT MTU is
+    // min(both sides), and a 247 cap here made a Switch 2 console's 512 settle at
+    // 247, after which it wrote nothing and would not pair.
+    //
+    // Derive the ceiling instead of hardcoding it. HCI_ACL_PAYLOAD_SIZE differs per
+    // build -- 512+4+3 on nRF, but only 256 on Pico unless CONFIG_DS5_DROP_SCREAM --
+    // and asking for more than the buffer holds breaks the MTU exchange outright
+    // (observed on Pico W: the console connects, att_mtu stays 0, nothing proceeds).
+    // 512 is the useful maximum; a 64-byte SInput report fits one notification either
+    // way, so lower-buffer builds lose nothing except Switch 2 output, which needs the
+    // console's full 512.
+    #define JP_ATT_MTU_CEILING (HCI_ACL_PAYLOAD_SIZE - 4)
+    l2cap_set_max_le_mtu(JP_ATT_MTU_CEILING < 512 ? JP_ATT_MTU_CEILING : 512);
+
 
     printf("[BTSTACK_HOST] Init SM...\n");
     sm_init();
@@ -687,6 +814,11 @@ static void setup_hid_handlers(void)
     // is secured with LE Secure Connections. Request SC (peers without SC fall
     // back to legacy automatically, so other controllers are unaffected).
     sm_set_io_capabilities(IO_CAPABILITY_NO_INPUT_NO_OUTPUT);
+    // Left unconditional on purpose. These requirements only go on the wire inside an
+    // SMP Pairing Request/Response, and this build never initiates SMP as a peripheral
+    // (ENABLE_LE_PROACTIVE_AUTHENTICATION is not defined), so a Switch 2 -- which pairs
+    // at the application level over 0x15 and never starts SMP -- never sees them.
+    // MouthPad needs SECURE_CONNECTION to stream HID notifications, so do not weaken it.
     sm_set_authentication_requirements(SM_AUTHREQ_BONDING | SM_AUTHREQ_SECURE_CONNECTION);
     sm_set_encryption_key_size_range(7, 16);
 
@@ -718,20 +850,43 @@ static void setup_hid_handlers(void)
     printf("[BTSTACK_HOST] Init LE Device DB...\n");
     le_device_db_init();
 
-    // Initialize classic BT HID Host
-    printf("[BTSTACK_HOST] Init Classic HID Host...\n");
-    memset(&classic_state, 0, sizeof(classic_state));
-    // Set security level BEFORE hid_host_init (it registers L2CAP services with this level)
-    gap_set_security_level(LEVEL_0);  // DS3 doesn't support SSP
-    hid_host_init(classic_hid_descriptor_storage, sizeof(classic_hid_descriptor_storage));
-    hid_host_register_packet_handler(hid_host_packet_handler);
+    // Initialize classic BT HID Host — but NOT in Switch-BT output mode: the HID
+    // host registers L2CAP listening services on PSM 0x11/0x13 (control/interrupt),
+    // the exact channels our HID *device* role needs. Both can't own them, so the
+    // Switch's inbound connection would land on the host handler instead of
+    // switch_bt. In Switch-BT mode we emulate a controller (input comes from GPIO/
+    // USB), so the host is unnecessary — skip it and let switch_bt own the channels.
+    bool skip_hid_host = false;
+#ifdef CONFIG_BT_CLASSIC_OUTPUT
+    skip_hid_host = (ble_output_get_mode() == BLE_MODE_SWITCH_BT);
+#endif
+    if (!skip_hid_host) {
+        printf("[BTSTACK_HOST] Init Classic HID Host...\n");
+        memset(&classic_state, 0, sizeof(classic_state));
+        // Set security level BEFORE hid_host_init (it registers L2CAP services with this level)
+        gap_set_security_level(LEVEL_0);  // DS3 doesn't support SSP
+        hid_host_init(classic_hid_descriptor_storage, sizeof(classic_hid_descriptor_storage));
+        hid_host_register_packet_handler(hid_host_packet_handler);
+    } else {
+        printf("[BTSTACK_HOST] Switch-BT mode: skipping HID host (device role owns PSM 0x11/0x13)\n");
+    }
 
     // SDP server - needed for DS4/DS5 reconnection (they query Device ID)
     sdp_init();
-    device_id_create_sdp_record(device_id_sdp_service_buffer, 0x10003,
-                                DEVICE_ID_VENDOR_ID_SOURCE_BLUETOOTH,
-                                BLUETOOTH_COMPANY_ID_BLUEKITCHEN_GMBH, 1, 1);
-    sdp_register_service(device_id_sdp_service_buffer);
+    // Skip the adapter's own Device ID record in Switch-BT mode — switch_bt registers
+    // the Nintendo (057E/2009) Device ID, and a second record would let the Switch
+    // read the wrong VID/PID.
+    if (!skip_hid_host) {
+        device_id_create_sdp_record(device_id_sdp_service_buffer, 0x10003,
+                                    DEVICE_ID_VENDOR_ID_SOURCE_BLUETOOTH,
+                                    BLUETOOTH_COMPANY_ID_BLUEKITCHEN_GMBH, 1, 1);
+        sdp_register_service(device_id_sdp_service_buffer);
+    }
+#ifdef CONFIG_BT_CLASSIC_OUTPUT
+    // Switch-BT mode: register our Pro Controller HID device role now — AFTER
+    // l2cap_init()/sdp_init() above (registering earlier would be wiped).
+    if (skip_hid_host) switch_bt_register_device();
+#endif
     printf("[BTSTACK_HOST] SDP server initialized\n");
 
     // Allow sniff mode and role switch for classic BT (improves compatibility)
@@ -994,6 +1149,72 @@ static void btstack_host_restore_last_connected(void)
 static uint32_t scan_timeout_end = 0;  // 0 = no timeout (indefinite scan)
 static bool scan_suppressed = false;   // App can suppress auto-restart (e.g. USB device connected)
 
+// Hard suppression: a wireless *output* mode owns the radio for the whole session
+// (Switch 2 BLE, Switch Pro over Classic). scan_suppressed alone is not enough —
+// it is a transient flag that the BLE.DROP holdoff expiry and every explicit
+// start_timed_scan() clear, so the central quietly resumed scanning + GIAC inquiry
+// behind a live emulated controller and starved its link. Observed on Pico W: the
+// console connects at 15 ms, then never exchanges MTU or writes its pairing command.
+static bool scan_suppressed_hard = false;
+
+// Who last touched the suppression flags. Every setter is reachable from several
+// places and "scanning is off" on its own gave no clue which one did it; this is
+// reported by BT.STATUS.
+static const char *scan_supp_src = "none";
+
+// Scan paused because a controller is connected (the radio belongs to the link).
+// This has to be a flag that btstack_host_start_scan() itself honours, not just a
+// stop_scan call: the idle safety net below counts only CLASSIC links, so with a
+// BLE pad connected it kept "resuming" the scan, the policy kept stopping it, and
+// the two ping-ponged every loop iteration -- thrashing the radio hard enough to
+// stall HID notifications on the very link it was protecting. Deliberately NOT
+// the app-facing scan_suppressed flag, which the app owns for its own reasons.
+static bool scan_paused_for_link;
+
+// Connection parameters for outgoing BLE links, applied once the stack is up.
+// BTstack's defaults (hci.c) are built for low-power sensors, not input
+// devices: interval 10-30 ms with connection latency 4, which lets the
+// peripheral skip four connection events and pushes worst-case input latency
+// past 150 ms. Worse, a peripheral that coalesces (ours keeps only the newest
+// pending report, as does basically every gamepad) loses a press and release
+// that both land inside one window, so fast taps never reach the wire.
+//
+// Applied lazily, NOT from init: gap_set_connection_parameters() writes through
+// BTstack's hci_stack POINTER, which is NULL until hci_init() runs. Boards that
+// let this layer bring BTstack up are fine, but the ones where BTstack is
+// initialised externally (the USB-dongle host) reached the eager call first and
+// hard-faulted at boot -- the MCU went silent and its dongle never powered up.
+static void apply_ble_conn_params_once(void)
+{
+    static bool done;
+    if (done || !hid_state.powered_on) return;
+    done = true;
+    gap_set_connection_parameters(
+        0x0060,  // conn scan interval: 60 ms (unit 0.625 ms) -- BTstack default
+        0x0030,  // conn scan window:   30 ms (unit 0.625 ms) -- BTstack default
+        6,       // conn interval min:  7.5 ms (unit 1.25 ms)
+        12,      // conn interval max:  15 ms  (unit 1.25 ms)
+        0,       // conn latency:       0 -- never skip a connection event
+        0x0048,  // supervision timeout: 720 ms (unit 10 ms)
+        0x0010,  // min CE length: 10 ms (unit 0.625 ms) -- BTstack default
+        0x0030); // max CE length: 30 ms (unit 0.625 ms) -- BTstack default
+    printf("[BTSTACK_HOST] BLE connection parameters applied (7.5-15ms, latency 0)\n");
+}
+
+// BLE diagnostics surfaced to the peer debug frame (see uart_peer_debug_t).
+static uint32_t ble_reports_seen;
+static uint8_t  ble_last_disc_reason;
+
+bool btstack_host_scan_hard_suppressed(void)
+{
+    return scan_suppressed_hard;
+}
+
+bool btstack_host_scan_suppressed(void)
+{
+    return scan_suppressed;
+}
+
 // Pending BLE gamepad: when we see a gamepad appearance or HID UUID but no name in the
 // ADV packet, stash the address and wait for the scan response (which typically contains
 // the name). This prevents connecting to Xbox controllers as "Generic BLE Gamepad".
@@ -1016,8 +1237,12 @@ void btstack_host_start_scan(void)
 #ifdef BTSTACK_DEFER_SCAN
     if (!btstack_host_scan_enabled) return;
 #endif
-    if (scan_suppressed) {
+    if (scan_suppressed || scan_suppressed_hard) {
         return;  // App suppressed scanning (e.g. BT host disabled)
+    }
+
+    if (scan_paused_for_link) {
+        return;  // a controller is connected; discovery is an explicit act
     }
 
     if (!hid_state.powered_on) {
@@ -1029,8 +1254,13 @@ void btstack_host_start_scan(void)
         return;  // Already scanning
     }
 
-    printf("[BTSTACK_HOST] Starting BLE scan...\n");
-    gap_set_scan_params(1, SCAN_INTERVAL, SCAN_WINDOW, 0);
+    // Yield the radio to any live connection (see SCAN_*_BUSY above).
+    const bool busy = btstack_classic_get_connection_count() > 0;
+    scan_params_busy = busy;
+    printf("[BTSTACK_HOST] Starting BLE scan...%s\n", busy ? " (low duty, link active)" : "");
+    gap_set_scan_params(1,
+                        busy ? SCAN_INTERVAL_BUSY : SCAN_INTERVAL,
+                        busy ? SCAN_WINDOW_BUSY   : SCAN_WINDOW, 0);
     gap_start_scan();
     hid_state.scan_active = true;
     hid_state.state = BLE_STATE_SCANNING;
@@ -1088,17 +1318,54 @@ void btstack_host_start_timed_scan(uint32_t timeout_ms)
         return;
     }
 
+    if (scan_suppressed_hard) {
+        printf("[BTSTACK_HOST] Timed scan ignored: wireless output mode owns the radio\n");
+        return;
+    }
     scan_suppressed = false;  // Explicit scan request clears suppression
+    scan_paused_for_link = false;  // the user asked for discovery; allow it
+    scan_supp_src = "timed-scan";
     scan_timeout_end = btstack_run_loop_get_time_ms() + timeout_ms;
     printf("[BTSTACK_HOST] Starting timed scan (%lums)\n", (unsigned long)timeout_ms);
     btstack_host_start_scan();
 }
 
+const char *btstack_host_scan_supp_src(void)
+{
+    return scan_supp_src;
+}
+
 void btstack_host_suppress_scan(bool suppress)
 {
     scan_suppressed = suppress;
+    scan_supp_src = suppress ? "app" : "app-release";
     if (suppress && btstack_host_is_scanning()) {
         btstack_host_stop_scan();
+    }
+}
+
+// Latched variant for wireless output modes. Survives the BLE.DROP holdoff and
+// explicit scan requests; only another call with false lifts it.
+void btstack_host_suppress_scan_latched(bool suppress)
+{
+    scan_suppressed_hard = suppress;
+    if (!suppress) {
+        // Release the soft flag as well. Clearing only the hard one left
+        // scan_suppressed stuck true and the central permanently deaf, which
+        // reads as supp=true / hsupp=false in BT.STATUS.
+        scan_suppressed = false;
+        scan_supp_src = "latched-release";
+        return;
+    }
+    {
+        scan_suppressed = true;
+        scan_supp_src = "latched";
+        if (btstack_host_is_scanning()) {
+            btstack_host_stop_scan();
+        }
+        if (classic_state.inquiry_active) {
+            btstack_host_stop_scan();
+        }
     }
 }
 
@@ -1112,6 +1379,7 @@ void btstack_host_ble_drop_all(uint32_t holdoff_ms)
 {
     ble_drop_holdoff_until = btstack_run_loop_get_time_ms() + holdoff_ms;
     scan_suppressed = true;
+    scan_supp_src = "ble-drop";
     if (btstack_host_is_scanning()) {
         btstack_host_stop_scan();
     }
@@ -1137,6 +1405,11 @@ void btstack_host_ble_drop_all(uint32_t holdoff_ms)
 
 void btstack_host_connect_ble(bd_addr_t addr, bd_addr_type_t addr_type)
 {
+    // Single choke point for every central-role BLE connect. A wireless output
+    // mode owns the radio: a doomed 4s gap_connect() to a bonded pad that is not
+    // even powered on will starve the console's link to us.
+    if (scan_suppressed_hard) return;
+
     printf("[BTSTACK_HOST] Connecting to %02X:%02X:%02X:%02X:%02X:%02X\n",
            addr[0], addr[1], addr[2], addr[3], addr[4], addr[5]);
 
@@ -1149,9 +1422,73 @@ void btstack_host_connect_ble(bd_addr_t addr, bd_addr_type_t addr_type)
     hid_state.state = BLE_STATE_CONNECTING;
     hid_state.reconnect_attempt_time = btstack_run_loop_get_time_ms();
 
+    apply_ble_conn_params_once();
+
     // Create connection
     uint8_t status = gap_connect(addr, addr_type);
     printf("[BTSTACK_HOST] gap_connect returned status=%d\n", status);
+
+    if (status != ERROR_CODE_SUCCESS) {
+        // The attempt was never issued, so no LE_CONNECTION_COMPLETE can arrive.
+        // Staying in CONNECTING parked the radio for BLE_CONNECT_TIMEOUT_MS and
+        // then retried into the same refusal, forever: every periodic reconnect
+        // logged status=12 and the receiver could never connect again until it
+        // was power-cycled.
+        hid_state.state = BLE_STATE_IDLE;
+        hid_state.reconnect_attempt_time = 0;
+
+        if (status == ERROR_CODE_COMMAND_DISALLOWED) {
+            // gap_connect() refuses for two persistent reasons (hci.c): an
+            // outgoing LE connect still flagged active, or an hci_connection_t
+            // for this address left in any state but RECEIVED_DISCONNECTION_
+            // COMPLETE. Neither clears itself.
+            //
+            // But a LIVE link refuses for the same reason, because the entry is
+            // OPEN -- a periodic reconnect that fires while the pad is already
+            // connected lands here. Tearing that down would drop the working
+            // link (local-terminate, reason 0x16), so an OPEN entry means
+            // "already connected" and there is nothing to recover.
+            hci_connection_t *existing = hci_connection_for_bd_addr_and_type(addr, addr_type);
+            if (existing != NULL && existing->state == OPEN) {
+                printf("[BTSTACK_HOST] Already connected to this address — reconnect skipped\n");
+                // Put back what this function changed before the doomed attempt:
+                // the link is up, and the scan it stopped is the low-duty scan
+                // that runs alongside a connection.
+                hid_state.state = BLE_STATE_CONNECTED;
+                btstack_host_start_scan();
+                return;
+            }
+            gap_connect_cancel();
+            if (existing != NULL && existing->con_handle != HCI_CON_HANDLE_INVALID) {
+                if (existing->state == SENT_DISCONNECT) {
+                    // Already mid-disconnect: gap_disconnect() is a no-op here,
+                    // and the controller never delivered the matching
+                    // DISCONNECTION_COMPLETE, so the entry never reaches
+                    // RECEIVED_DISCONNECTION_COMPLETE and hci.c refuses every
+                    // future gap_connect() to this address. Observed as an
+                    // endless scan -> connect -> status=12 loop with the pad
+                    // sitting there advertising, unconnectable until reboot.
+                    //
+                    // RECEIVED_DISCONNECTION_COMPLETE is the one state
+                    // gap_connect() accepts and reuses (it resets the role and
+                    // dials again), so parking the entry there is what lets the
+                    // next attempt through without leaking the slot.
+                    printf("[BTSTACK_HOST] Connection stuck in SENT_DISCONNECT "
+                           "(handle=0x%04X) — releasing it for reconnect\n",
+                           existing->con_handle);
+                    existing->state = RECEIVED_DISCONNECTION_COMPLETE;
+                } else {
+                    printf("[BTSTACK_HOST] Stale connection entry (state=%d) handle=0x%04X — disconnecting\n",
+                           (int)existing->state, existing->con_handle);
+                    gap_disconnect(existing->con_handle);
+                }
+            }
+        }
+
+        // Scanning was stopped above for a connect that never happened. Put the
+        // radio back to work instead of idling until the next periodic attempt.
+        btstack_host_start_scan();
+    }
 }
 
 // ============================================================================
@@ -1207,6 +1544,7 @@ void btstack_host_process(void)
     // Process any pending BLE HID report (deferred from BTstack callback to avoid stack overflow)
     if (ble_report_pending) {
         ble_report_pending = false;
+        ble_reports_seen++;
         route_ble_hid_report(pending_ble_conn_index, pending_ble_report, pending_ble_report_len);
     }
 
@@ -1248,6 +1586,109 @@ void btstack_host_process(void)
         printf("[BTSTACK_HOST] BLE connection attempt timed out after %dms\n", BLE_CONNECT_TIMEOUT_MS);
         gap_connect_cancel();
         hid_state.state = BLE_STATE_IDLE;
+        hid_state.reconnect_attempt_time = 0;
+    }
+
+    apply_ble_conn_params_once();
+
+    // Reap phantom BLE connections. Our table is bookkeeping; BTstack's own
+    // connection list is the truth. If a link dropped without us processing the
+    // disconnect -- a missed event, or a handle we had already overwritten --
+    // the entry here survives forever, and that is ruinous in three ways at
+    // once: the controller's last report stays applied (a direction held at the
+    // moment it died stays held), the connection count keeps the scan switched
+    // off so the pad can never be rediscovered, and the slot is never freed.
+    // Observed in the field as "B reports conn_count=1 but no input arrives".
+    for (int i = 0; i < MAX_BLE_CONNECTIONS; i++) {
+        ble_connection_t *bc = &hid_state.connections[i];
+        if (bc->handle == HCI_CON_HANDLE_INVALID) continue;
+        if (hci_connection_for_handle(bc->handle) != NULL) continue;  // still real
+
+        printf("[BTSTACK_HOST] Reaping phantom BLE connection handle=0x%04X name='%s'\n",
+               bc->handle, bc->name);
+        // Zero the controller's input through the normal disconnect path so the
+        // held state clears, then free the slot.
+        if (bc->conn_index > 0) {
+            bt_on_disconnect(bc->conn_index);
+        }
+        if (bc->hids_cid != 0) {
+            hids_client_disconnect(bc->hids_cid);
+        }
+        mp_nus_disconnected(bc->handle);
+        memset(bc, 0, sizeof(*bc));
+        bc->handle = HCI_CON_HANDLE_INVALID;
+        if (hid_state.state == BLE_STATE_CONNECTED || hid_state.state == BLE_STATE_READY) {
+            hid_state.state = BLE_STATE_IDLE;
+        }
+        // The scan was suppressed on the strength of this connection; with it
+        // gone, discovery has to come back or the receiver stays deaf.
+        btstack_host_start_scan();
+    }
+
+    // HID-ready watchdog for BLE links. Classic has had one of these since
+    // forever (CLASSIC_CONNECT_TIMEOUT_MS below); BLE never did, and the gap is
+    // ugly: a link that completes at HCI level but never finishes GATT
+    // discovery/subscription keeps its slot indefinitely. BTstack still holds a
+    // real hci_connection, so the phantom reaper above correctly leaves it
+    // alone, yet no report ever arrives -- the controller's last state stays
+    // applied (a direction held when it stalled stays held) and the connection
+    // count keeps discovery quiet. Drop it and let the reconnect path retry.
+    for (int i = 0; i < MAX_BLE_CONNECTIONS; i++) {
+        ble_connection_t *bc = &hid_state.connections[i];
+        if (bc->handle == HCI_CON_HANDLE_INVALID) continue;
+        if (bc->hid_ready || bc->connect_ms == 0) continue;
+        uint32_t held = (uint32_t)(btstack_run_loop_get_time_ms() - bc->connect_ms);
+        if (held < BLE_HID_READY_TIMEOUT_MS) continue;
+        printf("[BTSTACK_HOST] BLE link never reached HID-ready in %lums "
+               "(handle=0x%04X name='%s') — dropping to retry\n",
+               (unsigned long)held, bc->handle, bc->name);
+        gap_disconnect(bc->handle);
+    }
+
+    // Scan policy: once something is connected the radio belongs to the link.
+    // Discovery runs while nothing is connected (the reconnect paths below dial
+    // the bonded device first), and picking up a SECOND device is an explicit
+    // act -- the dongle button or BT.SCAN, both of which arrive as a timed scan
+    // and are left alone for their window.
+    //
+    // This used to merely drop the scan to a low duty cycle and keep hunting
+    // forever alongside the link. On a single radio that is pure interference
+    // for a receiver that already has its pad.
+    {
+        const bool linked = btstack_classic_get_connection_count() > 0;
+        if (linked && scan_timeout_end == 0) {
+            if (!scan_paused_for_link) {
+                scan_paused_for_link = true;
+                printf("[BTSTACK_HOST] Device connected — pausing scan"
+                       " (button or BT.SCAN to add another)\n");
+            }
+            if (hid_state.scan_active) btstack_host_stop_scan();
+        } else if (!linked && scan_paused_for_link) {
+            scan_paused_for_link = false;
+            printf("[BTSTACK_HOST] Last device gone — resuming discovery\n");
+            btstack_host_start_scan();
+        }
+    }
+
+    // While an explicit timed scan does run next to a live link, keep it at the
+    // gentler duty cycle so it does not starve that link.
+    if (hid_state.scan_active &&
+        (btstack_classic_get_connection_count() > 0) != scan_params_busy) {
+        btstack_host_stop_scan();
+        btstack_host_start_scan();
+    }
+
+    // Stale connect timestamp recovery. The timeout above only fires while the state
+    // is CONNECTING, and the idle safety net below only fires when this timestamp is
+    // zero. So any path that leaves CONNECTING without clearing it wedges both: the
+    // scan stops for the connect attempt and never resumes, and the central goes
+    // permanently deaf. Observed on a receiver-mode dongle -- scanning went false a
+    // few seconds after boot and stayed false indefinitely, while a manual BT.SCAN
+    // recovered it instantly.
+    if (hid_state.reconnect_attempt_time != 0 &&
+        hid_state.state != BLE_STATE_CONNECTING &&
+        (btstack_run_loop_get_time_ms() - hid_state.reconnect_attempt_time) >= BLE_CONNECT_TIMEOUT_MS) {
+        printf("[BTSTACK_HOST] Clearing stale connect timestamp (state=%d)\n", hid_state.state);
         hid_state.reconnect_attempt_time = 0;
     }
 
@@ -1318,7 +1759,7 @@ void btstack_host_process(void)
     if (ble_drop_holdoff_until != 0 &&
         (int32_t)(btstack_run_loop_get_time_ms() - ble_drop_holdoff_until) >= 0) {
         ble_drop_holdoff_until = 0;
-        scan_suppressed = false;
+        if (!scan_suppressed_hard) { scan_suppressed = false; scan_supp_src = "holdoff-expired"; }
         printf("[BTSTACK_HOST] BLE drop holdoff expired, reconnect resumed\n");
     }
 
@@ -1331,14 +1772,23 @@ void btstack_host_process(void)
     //   - Classic connection setup in progress (name request, HID connect pending)
 #ifndef CONFIG_USB2BLE
     if (hid_state.powered_on &&
-        !scan_suppressed &&
+        !scan_suppressed && !scan_suppressed_hard &&
+        // Honour the connected-link pause, or this fires every tick: it calls
+        // start_scan(), start_scan() returns early because of the pause, nothing
+        // changes, and it fires again -- ~48 log lines a second.
+        !scan_paused_for_link &&
         hid_state.state == BLE_STATE_IDLE &&
         hid_state.reconnect_attempt_time == 0 &&
         !hid_state.scan_active &&
         classic_state.waiting_for_incoming_time == 0 &&
         !classic_state.pending_valid &&
-        btstack_classic_get_connection_count() == 0) {
-        printf("[BTSTACK_HOST] Safety: idle with no connections, resuming scan\n");
+        // Classic links only. The combined count includes BLE, so one
+        // unrelated BLE HID device in range (a TV remote, a keyboard) holds
+        // this gate shut forever: Classic inquiry never resumes, and since the
+        // Classic auto-connect path is gated on classic_state.inquiry_active, a
+        // bonded Classic pad can then never be rediscovered after it powers off.
+        classic_link_count() == 0) {
+        printf("[BTSTACK_HOST] Safety: idle with no Classic links, resuming scan\n");
         btstack_host_start_scan();
     }
 #endif
@@ -1355,8 +1805,25 @@ void btstack_host_process(void)
     // bonding — they expect the central to connect directly via gap_connect().
     // After the rapid reconnect attempts (right after disconnect) are exhausted,
     // alternate between scanning and reconnection attempts.
+    // The scan keeps running at low duty while a link is up, and the state/scan
+    // sync above can put the state back to SCANNING, so without the bonded_up
+    // test this fires at every interval against an already-connected pad. The
+    // refused gap_connect() then looked like a stale entry and tore the live
+    // link down (local terminate, reason 0x16). The IDLE path below has always
+    // made this check; this one has to make it too.
+    bool periodic_bonded_up = false;
+    if (hid_state.has_last_connected) {
+        for (int i = 0; i < MAX_BLE_CONNECTIONS; i++) {
+            if (hid_state.connections[i].handle != HCI_CON_HANDLE_INVALID &&
+                memcmp(hid_state.connections[i].addr, hid_state.last_connected_addr, 6) == 0) {
+                periodic_bonded_up = true;
+                break;
+            }
+        }
+    }
     if (hid_state.state == BLE_STATE_SCANNING &&
         hid_state.has_last_connected &&
+        !periodic_bonded_up &&
         hid_state.scan_start_time != 0 &&
         (btstack_run_loop_get_time_ms() - hid_state.scan_start_time) >= BLE_RECONNECT_INTERVAL_MS) {
         printf("[BTSTACK_HOST] Periodic reconnection to bonded device '%s'\n",
@@ -1375,7 +1842,7 @@ void btstack_host_process(void)
     static uint32_t idle_reconnect_ms;
     if (hid_state.state == BLE_STATE_IDLE &&
         hid_state.powered_on &&
-        !scan_suppressed &&
+        !scan_suppressed && !scan_suppressed_hard &&
         hid_state.has_last_connected &&
         hid_state.reconnect_attempt_time == 0) {
         bool bonded_up = false;
@@ -1549,6 +2016,16 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
                 // Set local name (for devices that want to see us)
                 // Skip when acting as BLE peripheral — ble_output sets its own name
 #ifndef CONFIG_USB2BLE
+#ifdef CONFIG_BT_CLASSIC_OUTPUT
+                // In Switch-BT output mode we ARE a Pro Controller — this handler
+                // runs after switch_bt_late_init and would otherwise clobber the
+                // identity, so set the full Pro Controller GAP identity (name +
+                // gamepad CoD + EIR advertising the HID service) here, the
+                // authoritative post-HCI point. Returns before the generic setup.
+                if (ble_output_get_mode() == BLE_MODE_SWITCH_BT)
+                    switch_bt_apply_gap_identity();
+                else
+#endif
                 gap_set_local_name("Joypad Adapter");
 #endif
 
@@ -1562,6 +2039,9 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
 #ifndef CONFIG_USB2BLE
                 // Set class of device to Computer (Desktop Workstation)
                 // Skip when acting as BLE peripheral — appearance is set in adv data
+#ifdef CONFIG_BT_CLASSIC_OUTPUT
+                if (ble_output_get_mode() != BLE_MODE_SWITCH_BT)  // gamepad CoD already set above
+#endif
                 gap_set_class_of_device(0x000104);  // Major: Computer, Minor: Desktop
 
                 // Enable SSP (Secure Simple Pairing) on the controller
@@ -2103,8 +2583,11 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
                             }
                         }
 
-                        if (!is_direct_l2cap) {
+                        if (!is_direct_l2cap && !bh_switch_bt_mode()) {
                             // Standard incoming connection flow (DS3, DS4, DS5, or unknown device).
+                            // Skipped in Switch-BT device mode: the Switch is connecting to our
+                            // HID device role, so hid_device + SM handle L2CAP/security — the
+                            // host must not run remote-name/auth here.
                             // If this is actually a Wiimote reconnection where the name wasn't
                             // available yet, it will be detected later when the name resolves
                             // (see REMOTE_NAME_REQUEST_COMPLETE and HID_SUBEVENT_CONNECTION_OPENED).
@@ -2241,7 +2724,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
                     }
 
                     // Only the central role belongs to the host manager. When
-                    // this device is also a BLE peripheral (controller_btusb),
+                    // this device is also a BLE peripheral (universal),
                     // a host connecting to our gamepad output raises the SAME
                     // LE_CONNECTION_COMPLETE event with role=peripheral. Tracking
                     // it here would inflate the host connection/device count,
@@ -2317,6 +2800,10 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
         }
 
         case HCI_EVENT_REMOTE_NAME_REQUEST_COMPLETE: {
+            // Switch-BT device mode: don't run host driver-matching / hid_host_connect.
+            // The incoming connection is the Switch pairing to our HID device role;
+            // let hid_device handle the L2CAP channels.
+            if (bh_switch_bt_mode()) break;
             bd_addr_t name_addr;
             hci_event_remote_name_request_complete_get_bd_addr(packet, name_addr);
             uint8_t name_status = hci_event_remote_name_request_complete_get_status(packet);
@@ -2605,6 +3092,7 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
             uint8_t reason = hci_event_disconnection_complete_get_reason(packet);
 
             printf("[BTSTACK_HOST] Disconnected: handle=0x%04X reason=0x%02X\n", handle, reason);
+            ble_last_disc_reason = reason;
 
             ble_connection_t *conn = find_connection_by_handle(handle);
             if (conn) {
@@ -2661,10 +3149,13 @@ static void packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *packe
                     hid_state.reconnect_attempts++;
                     printf("[BTSTACK_HOST] Attempting BLE reconnection to stored device (attempt %d)...\n",
                            hid_state.reconnect_attempts);
+                    // Byte order matches btstack_host_connect_ble()'s log and the
+                    // scan reports. Printing this one reversed made a single pad
+                    // look like two different addresses in the same log.
                     printf("[BTSTACK_HOST] Connecting to %02X:%02X:%02X:%02X:%02X:%02X name='%s'\n",
-                           hid_state.last_connected_addr[5], hid_state.last_connected_addr[4],
-                           hid_state.last_connected_addr[3], hid_state.last_connected_addr[2],
-                           hid_state.last_connected_addr[1], hid_state.last_connected_addr[0],
+                           hid_state.last_connected_addr[0], hid_state.last_connected_addr[1],
+                           hid_state.last_connected_addr[2], hid_state.last_connected_addr[3],
+                           hid_state.last_connected_addr[4], hid_state.last_connected_addr[5],
                            hid_state.last_connected_name);
                     // Copy stored name to pending so it's available when connection completes
                     strncpy(hid_state.pending_name, hid_state.last_connected_name, sizeof(hid_state.pending_name) - 1);
@@ -2892,10 +3383,16 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
     uint8_t event_type = hci_event_packet_get_type(packet);
 
     switch (event_type) {
-        case SM_EVENT_JUST_WORKS_REQUEST:
+        case SM_EVENT_JUST_WORKS_REQUEST: {
+            hci_con_handle_t jw_handle = sm_event_just_works_request_get_handle(packet);
+            // Role gate: only confirm for links this central created. The BLE
+            // peripheral (universal's ble_output) has its own SM handler for
+            // the host link.
+            if (find_connection_by_handle(jw_handle) == NULL) break;
             printf("[BTSTACK_HOST] SM: Just Works request\n");
-            sm_just_works_confirm(sm_event_just_works_request_get_handle(packet));
+            sm_just_works_confirm(jw_handle);
             break;
+        }
 
         case SM_EVENT_PAIRING_STARTED:
             printf("[BTSTACK_HOST] SM: Pairing started\n");
@@ -3002,6 +3499,13 @@ static void sm_packet_handler(uint8_t packet_type, uint16_t channel, uint8_t *pa
                     }
                 }
             } else {
+                // Role gate: this recovery is for CONTROLLERS the central
+                // paired. Running it on the peripheral link (a host like
+                // macOS connecting to us) deleted the HOST's bond and forced
+                // central-style re-pairing, which corrupted the link's
+                // security — macOS then silently discarded keyboard/mouse
+                // HID (it requires a cleanly encrypted bond for typed input).
+                if (find_connection_by_handle(handle) == NULL) break;
                 // Re-encryption failed - remote likely lost bonding info
                 // Delete local bonding and request fresh pairing
                 printf("[BTSTACK_HOST] SM: Re-encryption failed, deleting bond and re-pairing...\n");
@@ -4927,6 +5431,13 @@ static void register_switch2_hid_listener(hci_con_handle_t con_handle)
 
     printf("[SW2_BLE] Notification listeners registered\n");
 
+#ifdef CONFIG_SW2_DUMP_GATT
+    // Bring-up: print the pad's whole attribute table, then stop. Do not start the
+    // init sequence, so the dump is not interleaved with command traffic.
+    sw2_dump_gatt(con_handle);
+    return;
+#endif
+
     // Enable notifications on ACK handle first (0x001B) - wait for confirmation
     static uint8_t ccc_enable[] = { 0x01, 0x00 };
     printf("[SW2_BLE] Enabling ACK notifications on CCC handle 0x%04X\n", SW2_ACK_CCC_HANDLE);
@@ -5459,6 +5970,11 @@ static void hid_host_packet_handler(uint8_t packet_type, uint16_t channel, uint8
             if (conn) {
                 conn->hid_ready = true;
 
+                // PnP (Device ID) SDP query happens at
+                // HID_SUBEVENT_DESCRIPTOR_AVAILABLE, not here: BTstack's
+                // internal HID descriptor SDP query may still be in flight at
+                // CONNECTION_OPENED and the SDP client is single-instance.
+
                 // Check if this is a direct-L2CAP device by profile or name
                 bool is_direct_l2cap = (conn->profile &&
                                         conn->profile->classic == BT_CLASSIC_DIRECT_L2CAP);
@@ -5590,10 +6106,14 @@ static void hid_host_packet_handler(uint8_t packet_type, uint16_t channel, uint8
                 printf("[BTSTACK_HOST] Calling bt_on_hid_ready(%d)\n", conn_index);
                 bt_on_hid_ready(conn_index);
 
-                // Query VID/PID via SDP if not yet known (deferred from CONNECTION_OPENED
-                // to avoid conflicting with BTstack's internal HID descriptor SDP query)
+                // Query VID/PID via SDP if the PID is not yet known (deferred from
+                // CONNECTION_OPENED to avoid conflicting with BTstack's internal HID
+                // descriptor SDP query). Gate on product_id alone: the remote-name
+                // handler pre-fills vendor_id from the name-profile default (e.g.
+                // "Wireless Controller" -> 054C), and 054C:0000 is exactly the
+                // half-known state that let ds4_match() claim a DualSense (#263).
                 classic_connection_t* desc_conn = find_classic_connection_by_cid(hid_cid);
-                if (desc_conn && desc_conn->vendor_id == 0 && desc_conn->product_id == 0) {
+                if (desc_conn && desc_conn->product_id == 0) {
                     memcpy(classic_state.pending_addr, desc_conn->addr, 6);
                     classic_state.pending_vid = 0;
                     classic_state.pending_pid = 0;
@@ -6159,6 +6679,15 @@ bool btstack_classic_get_connection(uint8_t conn_index, btstack_classic_conn_inf
     return true;
 }
 
+static uint8_t classic_link_count(void)
+{
+    uint8_t n = 0;
+    for (int i = 0; i < MAX_CLASSIC_CONNECTIONS; i++) {
+        if (classic_state.connections[i].active) n++;
+    }
+    return n;
+}
+
 // Get number of active connections (Classic + BLE)
 uint8_t btstack_classic_get_connection_count(void)
 {
@@ -6364,5 +6893,34 @@ void btstack_host_forget_device(const uint8_t bd_addr[6])
         memset(hid_state.last_connected_addr, 0, 6);
         hid_state.has_last_connected = false;
         btstack_host_save_last_connected();  // Save the cleared state
+    }
+}
+
+// Central diagnostics for the A-side heartbeat (see uart_peer_debug_t). B has no
+// USB, so this is the only window onto the BLE central's state.
+void btstack_host_get_ble_diag(uint32_t* reports, uint8_t* flags,
+                               uint8_t* last_disc_reason, char* name, int name_len)
+{
+    if (reports) *reports = ble_reports_seen;
+    if (last_disc_reason) *last_disc_reason = ble_last_disc_reason;
+    uint8_t f = 0;
+    const ble_connection_t* found = NULL;
+    for (int i = 0; i < MAX_BLE_CONNECTIONS; i++) {
+        const ble_connection_t* bc = &hid_state.connections[i];
+        if (bc->handle == HCI_CON_HANDLE_INVALID) continue;
+        found = bc;
+        if (bc->hid_ready) f |= 0x01;
+        f |= 0x02;
+        break;
+    }
+    if (flags) *flags = f;
+    if (name && name_len > 0) {
+        if (found && found->name[0]) {
+            int n = name_len - 1;
+            for (int i = 0; i < n; i++) name[i] = found->name[i];
+            name[n] = 0;
+        } else {
+            name[0] = 0;
+        }
     }
 }

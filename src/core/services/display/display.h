@@ -91,11 +91,20 @@ void display_bitmap(uint8_t x, uint8_t y, const uint8_t* bitmap, uint8_t w, uint
 // Check if display is initialized
 bool display_is_initialized(void);
 
-// Async display mode: display_update() marks dirty and returns immediately.
-// A platform thread calls display_flush() to do the actual I2C/SPI transfer.
+// Async display mode (the default): display_update() marks dirty and returns
+// immediately; the platform main loop pumps the transfer via display_task().
+// display_set_async(false) restores synchronous display_update() for a caller
+// that must have painted before continuing.
 void display_set_async(bool async);
 void display_flush(void);
 bool display_is_dirty(void);
+
+// Pump one page of any pending incremental flush. Each display-using app
+// calls this once per app_task() iteration, inside its OLED guard — NOT the
+// platform main loops: an unconditional call there anchors the display
+// service in every target and stops the linker dead-stripping it, which
+// overflowed RAM on universal_pico_w (display.c compiled but unused).
+void display_task(void);
 
 // Incremental flush: send ONE page per call instead of the whole frame.
 // Returns true while a flush is in progress (more pages remain), false

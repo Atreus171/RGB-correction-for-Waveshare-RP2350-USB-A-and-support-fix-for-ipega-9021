@@ -2,10 +2,14 @@
 
 Bluetooth controllers to a USB gamepad via Raspberry Pi Pico W. No soldering required.
 
-On a freshly flashed board this build enumerates as a **PS4 (DualShock 4) controller**, not a
-generic HID gamepad — `bt2usb` is compiled with `USBD_DEFAULT_MODE=USB_OUTPUT_MODE_PS4`. The mode
-is switchable at runtime and **persists in flash**, so a board whose mode was changed previously
-comes back up in the saved mode, not in PS4. See [USB output modes](#usb-output-modes) below.
+On a freshly flashed board this build enumerates as an **SInput controller**, the same default as
+every other adapter (`USBD_DEFAULT_MODE=USB_OUTPUT_MODE_SINPUT`). The mode is switchable at runtime
+and **persists in flash**, so a board whose mode was changed previously comes back up in the saved
+mode, not in SInput. See [USB output modes](#usb-output-modes) below.
+
+> ⚠️ Before 2.4.1 `bt2usb` was the one build that overrode this and came up in **PS4** mode. A board
+> flashed with 2.4.0 or earlier that was never switched will move to SInput on its first 2.4.1 boot;
+> a board with a saved mode keeps it.
 
 ## Parts Needed
 
@@ -24,7 +28,7 @@ make bt2usb_pico_w
 make flash-bt2usb_pico_w
 ```
 
-Output file: `releases/joypad_<commit>_bt2usb_pico_w.uf2`
+Output file: `releases/joypad_os_<commit>_bt2usb_pico_w.uf2`
 
 Alternatively, drag and drop the `.uf2` file onto the `RPI-RP2` drive that appears when the Pico W is in bootloader mode.
 
@@ -38,7 +42,7 @@ Alternatively, drag and drop the `.uf2` file onto the `RPI-RP2` drive that appea
    - **Switch Pro**: Hold the sync button on top
 3. With nothing connected, the Pico W scans automatically and will connect on its own
 4. The board LED shows which state it is in — see the table below
-5. The controller appears on the host PC (as a PS4 pad by default)
+5. The controller appears on the host PC (as an SInput pad by default)
 
 ### Board LED
 
@@ -85,7 +89,7 @@ Double-clicking BOOTSEL cycles through:
 SInput -> XInput -> PS3 -> PS4 -> Switch -> Keyboard/Mouse -> SInput
 ```
 
-A freshly flashed board starts in **PS4**, so the first double-click moves it to Switch.
+A freshly flashed board starts in **SInput**, so the first double-click moves it to XInput.
 Triple-click jumps straight back to SInput. Less common modes (DInput, PS Classic, Xbox Original,
 Xbox One, XAC) are not in the cycle — set those over the CDC config interface. **Each mode change
 re-enumerates the board on the USB bus**, so the host will briefly see the device disconnect and
@@ -96,14 +100,18 @@ power cycles. If a board comes up in an unexpected mode, triple-click to force i
 
 ## Button profiles
 
-Hold **SELECT for 2 seconds, then press D-pad Up/Down** to cycle *button profiles*.
+Hold **SELECT + D-pad Up** (previous) or **SELECT + D-pad Down** (next) together for about
+**0.7 s** to step through *button profiles*. The selection clamps at the ends; a quick tap passes
+through to the game.
 
 > ⚠️ This switches button **profiles**, not USB output modes — the two are separate controls and
-> have been confused in earlier revisions of this doc. `usbd_on_input()` routes the combo to
-> `profile_check_switch_combo()`. D-pad **Left/Right** during the combo is wired to an output-mode
-> callback that **only the 3DO device driver ever registers** (`3do_device.c:690`), so on `bt2usb`
-> — and on every other USB-device app — that pointer is NULL and pressing Left/Right does nothing.
-> Use BOOTSEL double-click for output modes.
+> have been confused in earlier revisions of this doc. **Output modes are BOOTSEL double-click**
+> (triple-click forces SInput); there is no D-pad gesture for them.
+>
+> `bt2usb` registers no combos of its own, so it inherits the router's built-in table
+> (`router_install_default_combos()`): SELECT + Up/Down steps profiles and SELECT + Left/Right drives
+> the **D-pad output-mode slider** (d-pad → left stick / right stick). Left/Right is therefore *not*
+> inert here, which earlier revisions of this doc claimed.
 
 ## Notes
 

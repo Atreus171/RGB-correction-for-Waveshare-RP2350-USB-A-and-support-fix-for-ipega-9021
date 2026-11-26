@@ -49,6 +49,7 @@ typedef enum {
     INPUT_SOURCE_NATIVE_PSX,        // PS1/PS2 controller (bit-bang SIO)
     INPUT_SOURCE_NATIVE_PCE,        // PCEngine/TG-16 controller (bit-bang mux)
     INPUT_SOURCE_NATIVE_JAGUAR,     // Atari Jaguar controller (bit-bang matrix)
+    INPUT_SOURCE_NATIVE_24G,        // nRF24L01+ / SF30 2.4G wireless receiver
     INPUT_SOURCE_GPIO,
     INPUT_SOURCE_SENSORS,
     INPUT_SOURCE_I2C_PEER,
@@ -71,6 +72,7 @@ typedef enum {
     OUTPUT_TARGET_UART,             // UART bridge to ESP32/other MCU
     OUTPUT_TARGET_WII_EXTENSION,              // Wii extension I2C slave (bt2wiiex apps)
     OUTPUT_TARGET_AMIGA,
+    OUTPUT_TARGET_REMOTE_PLAY,      // PS Remote Play (WiFi) — usb2wifi app
     OUTPUT_TARGET_COUNT             // Must be last — used to size arrays
 } output_target_t;
 
@@ -188,6 +190,40 @@ void router_get_motion_remap(int out[3]);
 void router_set_inject_buttons(uint32_t buttons);
 uint32_t router_get_inject_buttons(void);
 
+// Host-injected analog (INPUT.INJECT "analog"). Seven axes in input_event_t
+// order: LX, LY, RX, RY, L2, R2, RZ. Merged into every real input event the
+// same way the buttons are, taking whichever value sits further from the axis
+// resting position — so an injected stick and a real one cannot cancel each
+// other out, and a released trigger never beats a real pull. Pass NULL to stop
+// injecting analog entirely, which is not the same as passing a neutral array:
+// neutral still overrides a real stick that is barely off centre.
+void router_set_inject_analog(const uint8_t* analog);
+bool router_get_inject_analog(uint8_t* out);
+
+// Pre-register the Virtual Pad (CDC inject) player and publish one neutral
+// frame. Called when a config session starts input streaming, so the web
+// config's Input Test shows the row before the first injected press instead
+// of the row popping into existence mid-click.
+void router_announce_virtual_pad(void);
+
+// Address the router sees synthetic input arrive from, so a heartbeat event can
+// be told apart from a real controller's. MOUSE/KB are distinct devices so
+// CDC-injected pointer/typing state never collides with the gamepad overlay.
+#define ROUTER_INJECT_ADDR       0xD8
+#define ROUTER_INJECT_MOUSE_ADDR 0xD9
+#define ROUTER_INJECT_KB_ADDR    0xDA
+
+// Keeps injected input flowing when nothing else is attached.
+//
+// Injection is an overlay on real input events, so with no controller plugged
+// into the device there is nothing to overlay and the injected state never
+// reaches the output at all. This submits a synthetic event to carry it, but
+// only while no real input is arriving — with a controller attached its events
+// carry the injection already, and adding a second source would double it.
+//
+// Call from the main loop; it rate-limits itself.
+void router_inject_task(void);
+
 // Set global d-pad mode (applies to all inputs in router)
 // 0=d-pad, 1=left stick, 2=right stick
 void router_set_dpad_mode(uint8_t mode);
@@ -289,6 +325,12 @@ void router_reset_outputs(void);
 // Call this BEFORE removing the player from the player manager
 void router_device_disconnected(uint8_t dev_addr, int8_t instance);
 
+// Register a device as a player immediately on connect (no button press
+// needed). Used by builds that define CONFIG_REGISTER_ON_CONNECT (e.g. the
+// usb2neogeo_te tournament app); default apps keep press-to-join.
+void router_register_device(uint8_t dev_addr, uint8_t instance,
+                            input_transport_t transport, const char* name);
+
 // ============================================================================
 // OUTPUT TAP (Push-based notification)
 // ============================================================================
@@ -315,9 +357,20 @@ void router_set_tap_exclusive(output_target_t output, router_tap_callback_t call
 // ============================================================================
 
 // Output state structure (replaces players[] array)
+//
+// Cross-core handoff: Core 0 (input) produces, Core 1 (PIO console output)
+// consumes. `seq` is a seqlock version counter guarding `current_state` against
+// torn reads — the console could otherwise poll mid-write and get a frame with
+// some fields new and some stale (e.g. new buttons + old stick). Even = stable,
+// odd = write-in-progress; it increments by 2 per publish. A plain `volatile
+// uint32_t` (aligned 32-bit access is atomic on every target; RP2040's M0+ has
+// no CAS but needs none here — single writer per slot) plus __atomic_thread_fence
+// release/acquire barriers. Producers MUST write via router_publish(); consumers
+// read via router_get_output() (see router.c). Do not touch `current_state`
+// directly across cores.
 typedef struct {
-    input_event_t current_state;    // Latest event (atomic write)
-    volatile bool updated;           // New data flag
+    input_event_t current_state;    // Latest event (seqlock-protected payload)
+    volatile uint32_t seq;           // Seqlock version (even=stable, odd=writing)
     uint8_t player_id;               // Player slot assignment
     input_source_t source;           // Source of this input (for priority)
 } output_state_t;
