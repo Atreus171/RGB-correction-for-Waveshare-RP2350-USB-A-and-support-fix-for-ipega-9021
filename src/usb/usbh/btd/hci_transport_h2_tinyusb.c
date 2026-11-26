@@ -274,7 +274,11 @@ static int hci_transport_h2_send_packet(uint8_t packet_type, uint8_t *packet, in
             // bRequest: 0x00
             tusb_control_request_t request = {
                 .bmRequestType_bit = {
-                    .recipient = TUSB_REQ_RCPT_INTERFACE,
+                    // USB Bluetooth HCI commands use class/device request
+                    // 0x20. Windows uses this form for CSR8510 A10; using
+                    // interface recipient here produced 0x21 and clones may
+                    // reject the command before returning Command Complete.
+                    .recipient = TUSB_REQ_RCPT_DEVICE,
                     .type = TUSB_REQ_TYPE_CLASS,
                     .direction = TUSB_DIR_OUT
                 },
